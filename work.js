@@ -85,7 +85,30 @@ async function handleSave(request, env, corsHeaders) {
 // IP 缓存，避免重复查询
 const ipCache = new Map();
 
-// 查询 IP 地区信息（使用 ip-api.com，免费，无需 API Key）
+// 国家代码到中文的映射（常用）
+const countryCodeMap = {
+  'CN': '中国', 'US': '美国', 'JP': '日本', 'KR': '韩国', 'SG': '新加坡',
+  'HK': '香港', 'TW': '台湾', 'GB': '英国', 'DE': '德国', 'FR': '法国',
+  'RU': '俄罗斯', 'CA': '加拿大', 'AU': '澳大利亚', 'IN': '印度', 'BR': '巴西',
+  'NL': '荷兰', 'SE': '瑞典', 'CH': '瑞士', 'IT': '意大利', 'ES': '西班牙',
+  'PL': '波兰', 'TR': '土耳其', 'ID': '印尼', 'VN': '越南', 'TH': '泰国',
+  'MY': '马来西亚', 'PH': '菲律宾', 'UA': '乌克兰', 'MX': '墨西哥', 'AE': '阿联酋',
+  'ZA': '南非', 'SA': '沙特', 'AR': '阿根廷', 'BE': '比利时', 'AT': '奥地利',
+  'IL': '以色列', 'IE': '爱尔兰', 'PT': '葡萄牙', 'FI': '芬兰', 'NO': '挪威',
+  'DK': '丹麦', 'CZ': '捷克', 'HU': '匈牙利', 'RO': '罗马尼亚', 'BG': '保加利亚',
+  'SK': '斯洛伐克', 'LT': '立陶宛', 'LV': '拉脱维亚', 'EE': '爱沙尼亚', 'HR': '克罗地亚',
+  'SI': '斯洛文尼亚', 'GR': '希腊', 'IS': '冰岛', 'LU': '卢森堡', 'MT': '马耳他',
+  'CY': '塞浦路斯', 'LI': '列支敦士登', 'MC': '摩纳哥', 'AD': '安道尔', 'SM': '圣马力诺',
+  'VA': '梵蒂冈', 'MD': '摩尔多瓦', 'BY': '白俄罗斯', 'GE': '格鲁吉亚', 'AM': '亚美尼亚',
+  'AZ': '阿塞拜疆', 'KZ': '哈萨克斯坦', 'UZ': '乌兹别克', 'KG': '吉尔吉斯', 'TJ': '塔吉克',
+  'TM': '土库曼', 'MN': '蒙古', 'KP': '朝鲜', 'BD': '孟加拉', 'LK': '斯里兰卡',
+  'NP': '尼泊尔', 'BT': '不丹', 'MV': '马尔代夫', 'PK': '巴基斯坦', 'AF': '阿富汗',
+  'IR': '伊朗', 'IQ': '伊拉克', 'SY': '叙利亚', 'LB': '黎巴嫩', 'JO': '约旦',
+  'PS': '巴勒斯坦', 'KW': '科威特', 'QA': '卡塔尔', 'BH': '巴林', 'OM': '阿曼',
+  'YE': '也门', 'GE': '格鲁吉亚', 'MO': '澳门'
+};
+
+// 查询 IP 地区信息（使用 ipinfo.io，更可靠）
 async function getIpLocation(ip) {
   // 清理 IP（去掉端口等）
   const cleanIp = ip.split(':')[0].trim();
@@ -116,7 +139,8 @@ async function getIpLocation(ip) {
   }
   
   try {
-    const response = await fetch(`http://ip-api.com/json/${cleanIp}?fields=country,countryCode&lang=zh-CN`, {
+    // 使用 ipinfo.io（免费，无需 key，限制 1000/天）
+    const response = await fetch(`https://ipinfo.io/${cleanIp}/json`, {
       cf: { cacheTtl: 86400 }
     });
     
@@ -126,14 +150,36 @@ async function getIpLocation(ip) {
     
     const data = await response.json();
     
-    if (data.status === 'success') {
-      const result = `${data.countryCode || 'UN'}${data.country || '未知'}`;
+    if (data.country) {
+      const countryCode = data.country;
+      const countryName = countryCodeMap[countryCode] || data.country_name || '未知';
+      const result = `${countryCode}${countryName}`;
       ipCache.set(cleanIp, result);
       return result;
     } else {
-      throw new Error(data.message || '查询失败');
+      throw new Error('No country data');
     }
   } catch (e) {
+    // 备用：使用 ip-api.com
+    try {
+      const response2 = await fetch(`http://ip-api.com/json/${cleanIp}?fields=status,country,countryCode,message&lang=zh-CN`, {
+        cf: { cacheTtl: 86400 }
+      });
+      
+      if (response2.ok) {
+        const data2 = await response2.json();
+        if (data2.status === 'success' && data2.countryCode) {
+          const countryCode = data2.countryCode;
+          const countryName = countryCodeMap[countryCode] || data2.country || '未知';
+          const result = `${countryCode}${countryName}`;
+          ipCache.set(cleanIp, result);
+          return result;
+        }
+      }
+    } catch (e2) {
+      // 备用也失败
+    }
+    
     const result = 'UN未知';
     ipCache.set(cleanIp, result);
     return result;
@@ -424,4 +470,3 @@ async function handleAdmin(env) {
     headers: { 'Content-Type': 'text/html; charset=utf-8' }
   });
 }
-
