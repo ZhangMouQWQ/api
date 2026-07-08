@@ -105,10 +105,10 @@ const countryCodeMap = {
   'NP': '尼泊尔', 'BT': '不丹', 'MV': '马尔代夫', 'PK': '巴基斯坦', 'AF': '阿富汗',
   'IR': '伊朗', 'IQ': '伊拉克', 'SY': '叙利亚', 'LB': '黎巴嫩', 'JO': '约旦',
   'PS': '巴勒斯坦', 'KW': '科威特', 'QA': '卡塔尔', 'BH': '巴林', 'OM': '阿曼',
-  'YE': '也门', 'GE': '格鲁吉亚', 'MO': '澳门'
+  'YE': '也门', 'MO': '澳门'
 };
 
-// 查询 IP 地区信息（使用 ipinfo.io，更可靠）
+// 查询 IP 地区信息（使用 ipapi.co，对 Cloudflare Workers 更友好）
 async function getIpLocation(ip) {
   // 清理 IP（去掉端口等）
   const cleanIp = ip.split(':')[0].trim();
@@ -118,81 +118,64 @@ async function getIpLocation(ip) {
     return ipCache.get(cleanIp);
   }
   
-  // 排除内网/特殊地址
-  if (!cleanIp || 
-      cleanIp === '127.0.0.1' || 
-      cleanIp.startsWith('192.168.') || 
-      cleanIp.startsWith('10.') || 
-      cleanIp.startsWith('172.16.') ||
-      cleanIp.startsWith('172.17.') ||
-      cleanIp.startsWith('172.18.') ||
-      cleanIp.startsWith('172.19.') ||
-      cleanIp.startsWith('172.20.') ||
-      cleanIp.startsWith('172.21.') ||
-      cleanIp.startsWith('172.22.') ||
-      cleanIp.startsWith('172.23.') ||
-      cleanIp.startsWith('172.24.') ||
-      cleanIp.startsWith('172.25.') ||
-      cleanIp.startsWith('172.26.') ||
-      cleanIp.startsWith('172.27.') ||
-      cleanIp.startsWith('172.28.') ||
-      cleanIp.startsWith('172.29.') ||
-      cleanIp.startsWith('172.30.') ||
-      cleanIp.startsWith('172.31.') ||
-      cleanIp.startsWith('fc00:') ||
-      cleanIp.startsWith('fe80:') ||
-      cleanIp === '::1') {
-    const result = 'LOCAL局域网';
-    ipCache.set(cleanIp, result);
-    return result;
-  }
-  
-  try {
-    // 使用 ipinfo.io（免费，无需 key，限制 1000/天）
-    const response = await fetch(`https://ipinfo.io/${cleanIp}/json`, {
-      cf: { cacheTtl: 86400 }
-    });
-    
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    
-    const data = await response.json();
-    
-    if (data.country) {
-      const countryCode = data.country;
-      const countryName = countryCodeMap[countryCode] || data.country_name || '未知';
-      const result = `${countryCode}${countryName}`;
-      ipCache.set(cleanIp, result);
-      return result;
-    } else {
-      throw new Error('No country data');
-    }
-  } catch (e) {
-    // 备用：使用 ip-api.com
-    try {
-      const response2 = await fetch(`http://ip-api.com/json/${cleanIp}?fields=status,country,countryCode,message&lang=zh-CN`, {
+  // 依次尝试多个 API
+  const apis = [
+    // ipapi.co - 对 Workers 友好，免费 1000/天
+    async () => {
+      const response = await fetch(`https://ipapi.co/${cleanIp}/json/`, {
         cf: { cacheTtl: 86400 }
       });
-      
-      if (response2.ok) {
-        const data2 = await response2.json();
-        if (data2.status === 'success' && data2.countryCode) {
-          const countryCode = data2.countryCode;
-          const countryName = countryCodeMap[countryCode] || data2.country || '未知';
-          const result = `${countryCode}${countryName}`;
-          ipCache.set(cleanIp, result);
-          return result;
-        }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      if (data.country_code) {
+        const code = data.country_code;
+        return `${code}${countryCodeMap[code] || data.country_name || '未知'}`;
       }
-    } catch (e2) {
-      // 备用也失败
+      throw new Error('No country data');
+    },
+    // ipinfo.io
+    async () => {
+      const response = await fetch(`https://ipinfo.io/${cleanIp}/json`, {
+        cf: { cacheTtl: 86400 }
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      if (data.country) {
+        const code = data.country;
+        return `${code}${countryCodeMap[code] || '未知'}`;
+      }
+      throw new Error('No country data');
+    },
+    // ip-api.com
+    async () => {
+      const response = await fetch(`http://ip-api.com/json/${cleanIp}?fields=status,country,countryCode,message&lang=zh-CN`, {
+        cf: { cacheTtl: 86400 }
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      if (data.status === 'success' && data.countryCode) {
+        const code = data.countryCode;
+        return `${code}${countryCodeMap[code] || data.country || '未知'}`;
+      }
+      throw new Error(data.message || 'API failed');
     }
-    
-    const result = 'UN未知';
-    ipCache.set(cleanIp, result);
-    return result;
+  ];
+  
+  for (const api of apis) {
+    try {
+      const result = await api();
+      ipCache.set(cleanIp, result);
+      return result;
+    } catch (e) {
+      // 继续尝试下一个 API
+      continue;
+    }
   }
+  
+  // 所有 API 都失败
+  const result = 'UN未知';
+  ipCache.set(cleanIp, result);
+  return result;
 }
 
 // 从行中提取 IP 地址
