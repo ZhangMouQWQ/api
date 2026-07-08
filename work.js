@@ -127,7 +127,16 @@ async function getIpLocation(ip) {
       cleanIp.startsWith('172.17.') ||
       cleanIp.startsWith('172.18.') ||
       cleanIp.startsWith('172.19.') ||
-      cleanIp.startsWith('172.2') ||
+      cleanIp.startsWith('172.20.') ||
+      cleanIp.startsWith('172.21.') ||
+      cleanIp.startsWith('172.22.') ||
+      cleanIp.startsWith('172.23.') ||
+      cleanIp.startsWith('172.24.') ||
+      cleanIp.startsWith('172.25.') ||
+      cleanIp.startsWith('172.26.') ||
+      cleanIp.startsWith('172.27.') ||
+      cleanIp.startsWith('172.28.') ||
+      cleanIp.startsWith('172.29.') ||
       cleanIp.startsWith('172.30.') ||
       cleanIp.startsWith('172.31.') ||
       cleanIp.startsWith('fc00:') ||
