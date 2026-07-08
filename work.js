@@ -108,7 +108,7 @@ const countryCodeMap = {
   'YE': '也门', 'MO': '澳门'
 };
 
-// 查询 IP 地区信息（使用 ipapi.co，对 Cloudflare Workers 更友好）
+// 查询 IP 地区信息（使用 uapis.cn 作为首选接口）
 async function getIpLocation(ip) {
   // 清理 IP（去掉端口等）
   const cleanIp = ip.split(':')[0].trim();
@@ -120,7 +120,46 @@ async function getIpLocation(ip) {
   
   // 依次尝试多个 API
   const apis = [
-    // ipapi.co - 对 Workers 友好，免费 1000/天
+    // uapis.cn - 首选，返回中文地区信息更完整
+    async () => {
+      const response = await fetch(`https://uapis.cn/api/v1/network/ipinfo?ip=${cleanIp}`, {
+        cf: { cacheTtl: 86400 }
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      if (data.region && data.region.trim()) {
+        const region = data.region.trim();
+        // 提取国家代码
+        let code = 'UN';
+        for (const [k, v] of Object.entries(countryCodeMap)) {
+          if (region.includes(v)) {
+            code = k;
+            break;
+          }
+        }
+        // 如果无法匹配，根据常见特征判断
+        if (code === 'UN') {
+          if (/^(美国|USA?|United States)/.test(region)) code = 'US';
+          else if (/^(日本|Japan|JP)/.test(region)) code = 'JP';
+          else if (/^(韩国|Korea|KR)/.test(region)) code = 'KR';
+          else if (/^(新加坡|Singapore|SG)/.test(region)) code = 'SG';
+          else if (/^(香港|Hong Kong|HK)/.test(region)) code = 'HK';
+          else if (/^(台湾|Taiwan|TW)/.test(region)) code = 'TW';
+          else if (/^(英国|United Kingdom|GB|UK)/.test(region)) code = 'GB';
+          else if (/^(德国|Germany|DE)/.test(region)) code = 'DE';
+          else if (/^(法国|France|FR)/.test(region)) code = 'FR';
+          else if (/^(俄罗斯|Russia|RU)/.test(region)) code = 'RU';
+          else if (/^(加拿大|Canada|CA)/.test(region)) code = 'CA';
+          else if (/^(澳大利亚|Australia|AU)/.test(region)) code = 'AU';
+          else if (/^(中国|China|CN)/.test(region)) code = 'CN';
+        }
+        // 返回格式：代码 + 地区名（去掉空格）
+        const regionCompact = region.replace(/\s/g, '');
+        return `${code}${regionCompact}`;
+      }
+      throw new Error('No region data');
+    },
+    // ipapi.co - 备选
     async () => {
       const response = await fetch(`https://ipapi.co/${cleanIp}/json/`, {
         cf: { cacheTtl: 86400 }
@@ -133,7 +172,7 @@ async function getIpLocation(ip) {
       }
       throw new Error('No country data');
     },
-    // ipinfo.io
+    // ipinfo.io - 备选
     async () => {
       const response = await fetch(`https://ipinfo.io/${cleanIp}/json`, {
         cf: { cacheTtl: 86400 }
@@ -146,7 +185,7 @@ async function getIpLocation(ip) {
       }
       throw new Error('No country data');
     },
-    // ip-api.com
+    // ip-api.com - 最后备选
     async () => {
       const response = await fetch(`http://ip-api.com/json/${cleanIp}?fields=status,country,countryCode,message&lang=zh-CN`, {
         cf: { cacheTtl: 86400 }
