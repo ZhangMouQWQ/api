@@ -127,35 +127,38 @@ async function getIpLocation(ip) {
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
-      if (data.region && data.region.trim()) {
+      // region 可能是 "中国 上海 浦东"、"美国  "、或 "  "（空格）
+      if (data.region) {
         const region = data.region.trim();
-        // 提取国家代码
-        let code = 'UN';
-        for (const [k, v] of Object.entries(countryCodeMap)) {
-          if (region.includes(v)) {
-            code = k;
-            break;
+        if (region) {
+          // 提取国家代码
+          let code = 'UN';
+          for (const [k, v] of Object.entries(countryCodeMap)) {
+            if (region.includes(v)) {
+              code = k;
+              break;
+            }
           }
+          // 如果无法匹配，根据常见特征判断
+          if (code === 'UN') {
+            if (/^(美国|USA?|United States)/.test(region)) code = 'US';
+            else if (/^(日本|Japan|JP)/.test(region)) code = 'JP';
+            else if (/^(韩国|Korea|KR)/.test(region)) code = 'KR';
+            else if (/^(新加坡|Singapore|SG)/.test(region)) code = 'SG';
+            else if (/^(香港|Hong Kong|HK)/.test(region)) code = 'HK';
+            else if (/^(台湾|Taiwan|TW)/.test(region)) code = 'TW';
+            else if (/^(英国|United Kingdom|GB|UK)/.test(region)) code = 'GB';
+            else if (/^(德国|Germany|DE)/.test(region)) code = 'DE';
+            else if (/^(法国|France|FR)/.test(region)) code = 'FR';
+            else if (/^(俄罗斯|Russia|RU)/.test(region)) code = 'RU';
+            else if (/^(加拿大|Canada|CA)/.test(region)) code = 'CA';
+            else if (/^(澳大利亚|Australia|AU)/.test(region)) code = 'AU';
+            else if (/^(中国|China|CN)/.test(region)) code = 'CN';
+          }
+          // 返回格式：代码 + 国家名（从映射表取，不在映射表则取region第一部分）
+          const countryName = countryCodeMap[code] || region.split(/\s+/)[0];
+          return `${code}${countryName}`;
         }
-        // 如果无法匹配，根据常见特征判断
-        if (code === 'UN') {
-          if (/^(美国|USA?|United States)/.test(region)) code = 'US';
-          else if (/^(日本|Japan|JP)/.test(region)) code = 'JP';
-          else if (/^(韩国|Korea|KR)/.test(region)) code = 'KR';
-          else if (/^(新加坡|Singapore|SG)/.test(region)) code = 'SG';
-          else if (/^(香港|Hong Kong|HK)/.test(region)) code = 'HK';
-          else if (/^(台湾|Taiwan|TW)/.test(region)) code = 'TW';
-          else if (/^(英国|United Kingdom|GB|UK)/.test(region)) code = 'GB';
-          else if (/^(德国|Germany|DE)/.test(region)) code = 'DE';
-          else if (/^(法国|France|FR)/.test(region)) code = 'FR';
-          else if (/^(俄罗斯|Russia|RU)/.test(region)) code = 'RU';
-          else if (/^(加拿大|Canada|CA)/.test(region)) code = 'CA';
-          else if (/^(澳大利亚|Australia|AU)/.test(region)) code = 'AU';
-          else if (/^(中国|China|CN)/.test(region)) code = 'CN';
-        }
-        // 返回格式：代码 + 地区名（去掉空格）
-        const regionCompact = region.replace(/\s/g, '');
-        return `${code}${regionCompact}`;
       }
       throw new Error('No region data');
     },
@@ -203,6 +206,10 @@ async function getIpLocation(ip) {
   for (const api of apis) {
     try {
       const result = await api();
+      // 如果结果仍然是 UN未知，继续尝试下一个 API
+      if (result === 'UN未知') {
+        continue;
+      }
       ipCache.set(cleanIp, result);
       return result;
     } catch (e) {
