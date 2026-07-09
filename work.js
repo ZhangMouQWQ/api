@@ -124,15 +124,15 @@ async function aggregateLinks(env) {
   let successCount = 0;
   const errors = [];
 
-  // 1. 拉取所有上游链接
+  // 1. 拉取所有上游链接（带超时）
   for (const url of urls) {
     try {
-      const response = await fetch(url, {
+      const response = await fetchWithTimeout(url, {
         headers: { 
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         },
         cf: { cacheTtl: 60 }
-      });
+      }, 8000);
       
       if (!response.ok) {
         errors.push(`# Error: HTTP ${response.status} for ${url}`);
@@ -214,24 +214,32 @@ async function aggregateLinks(env) {
 // ==================== /fetch 端点（优先读缓存） ====================
 
 async function handleFetch(env, corsHeaders) {
-  // 优先返回缓存结果（由定时任务或上次保存时生成）
-  const cached = await env.LINKS_KV.get('cached_aggregate');
-  if (cached !== null && cached.trim() !== '') {
-    return new Response(cached, {
-      headers: { 
-        ...corsHeaders, 
-        'Content-Type': 'text/plain; charset=utf-8',
-        'Cache-Control': 'no-cache',
-        'X-Cache-Status': 'HIT'
-      }
-    });
+  // 优先返回缓存结果
+  try {
+    const cached = await env.LINKS_KV.get('cached_aggregate');
+    if (cached && cached.trim() !== '') {
+      return new Response(cached, {
+        headers: { 
+          ...corsHeaders, 
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Cache-Control': 'no-cache',
+          'X-Cache-Status': 'HIT'
+        }
+      });
+    }
+  } catch (e) {
+    console.error('Cache read error:', e.message);
   }
   
-  // 缓存未命中（首次部署或缓存过期），实时聚合
+  // 缓存未命中，实时聚合
   try {
     const output = await aggregateLinks(env);
-    // 实时聚合成功后也写入缓存
-    await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: 3600 });
+    // 实时聚合成功后写入缓存
+    try {
+      await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: 3600 });
+    } catch (e) {
+      console.error('Cache write error:', e.message);
+    }
     return new Response(output, {
       headers: { 
         ...corsHeaders, 
@@ -276,6 +284,20 @@ const countryCodeMap = {
   'YE': '也门', 'MO': '澳门'
 };
 
+// 带超时的 fetch 包装器
+async function fetchWithTimeout(url, options = {}, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timeoutId);
+    return response;
+  } catch (e) {
+    clearTimeout(timeoutId);
+    throw e;
+  }
+}
+
 // 查询 IP 地区信息（使用 uapis.cn 作为首选接口）
 async function getIpLocation(ip) {
   // 清理 IP（去掉端口等）
@@ -290,9 +312,9 @@ async function getIpLocation(ip) {
   const apis = [
     // uapis.cn - 首选，返回中文地区信息更完整
     async () => {
-      const response = await fetch(`https://uapis.cn/api/v1/network/ipinfo?ip=${cleanIp}`, {
+      const response = await fetchWithTimeout(`https://uapis.cn/api/v1/network/ipinfo?ip=${cleanIp}`, {
         cf: { cacheTtl: 86400 }
-      });
+      }, 3000);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
       if (data.region) {
@@ -328,9 +350,9 @@ async function getIpLocation(ip) {
     },
     // ipapi.co - 备选
     async () => {
-      const response = await fetch(`https://ipapi.co/${cleanIp}/json/`, {
+      const response = await fetchWithTimeout(`https://ipapi.co/${cleanIp}/json/`, {
         cf: { cacheTtl: 86400 }
-      });
+      }, 3000);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
       if (data.country_code) {
@@ -341,9 +363,9 @@ async function getIpLocation(ip) {
     },
     // ipinfo.io - 备选
     async () => {
-      const response = await fetch(`https://ipinfo.io/${cleanIp}/json`, {
+      const response = await fetchWithTimeout(`https://ipinfo.io/${cleanIp}/json`, {
         cf: { cacheTtl: 86400 }
-      });
+      }, 3000);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
       if (data.country) {
@@ -354,9 +376,9 @@ async function getIpLocation(ip) {
     },
     // ip-api.com - 最后备选
     async () => {
-      const response = await fetch(`http://ip-api.com/json/${cleanIp}?fields=status,country,countryCode,message&lang=zh-CN`, {
+      const response = await fetchWithTimeout(`http://ip-api.com/json/${cleanIp}?fields=status,country,countryCode,message&lang=zh-CN`, {
         cf: { cacheTtl: 86400 }
-      });
+      }, 3000);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
       if (data.status === 'success' && data.countryCode) {
@@ -411,7 +433,7 @@ async function handleAdmin(env) {
   const existing = await env.LINKS_KV.get('links') || '';
   const cached = await env.LINKS_KV.get('cached_aggregate');
   let cacheInfo = '暂无缓存';
-  if (cached !== null) {
+  if (cached) {
     const lines = cached.split('\n').filter(l => l.trim() && !l.startsWith('#')).length;
     cacheInfo = `已缓存（约 ${lines} 条记录）`;
   }
@@ -579,7 +601,7 @@ async function handleAdmin(env) {
         <li><strong>新增：</strong>自动识别每行中的 IP 地址，并在末尾追加 <code>#国家简拼国家名</code> 的地区信息</li>
         <li><span class="badge badge-new">NEW</span> <strong>IP 重试机制：</strong>若某 IP 首次查询归属地失败，会先跳过该 IP 继续处理其他行，待全部处理完成后重新查询失败的 IP，提高成功率</li>
         <li><span class="badge badge-new">NEW</span> <strong>自动缓存：</strong>每整半小时自动聚合所有链接并更新缓存；保存链接后也会自动刷新缓存</li>
-        <li>示例输出：<code>192.168.1.1:8080 #CN中国</code></li>
+        <li>示例输出：<code>192.168.1.1:8080#CN中国</code></li>
       </ul>
     </div>
   </div>
