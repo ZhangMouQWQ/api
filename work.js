@@ -195,6 +195,7 @@ async function processIpQueue(env) {
     let processedCount = 0;
     let failedCount = 0;
     let skippedCount = 0;
+    let retryLaterCount = 0;
     let batchCount = 0;
     const MAX_BATCH = 10; // 每批处理 10 个 IP 再写回 KV，减少 KV 操作次数
 
@@ -255,10 +256,12 @@ async function processIpQueue(env) {
         }
 
         if (location === 'UN未知' || location === '分析失败') {
-          lines[item.index] = `${item.line}#分析失败`;
-          failedCount++;
-          console.log(`[Queue] Failed for ${item.ip}: all APIs exhausted`);
+          // 首次失败，标记为 #分析失败-待重试，等待 1 分钟后重试
+          lines[item.index] = `${item.line}#分析失败-待重试`;
+          retryLaterCount++;
+          console.log(`[Queue] Failed for ${item.ip}: all APIs exhausted, will retry in 1 minute`);
         } else {
+          // 成功
           lines[item.index] = `${item.line}#${location}`;
           processedCount++;
           console.log(`[Queue] Success for ${item.ip}: ${location}`);
@@ -270,10 +273,80 @@ async function processIpQueue(env) {
       batchCount++;
     }
 
-    console.log(`[Queue] Completed. Batches: ${batchCount}, Processed: ${processedCount}, Failed: ${failedCount}, Skipped: ${skippedCount}`);
+    console.log(`[Queue] First pass completed. Batches: ${batchCount}, Processed: ${processedCount}, Failed: ${retryLaterCount}, Skipped: ${skippedCount}`);
+
+    // 第二轮：重试 #分析失败-待重试 的项（等待 1 分钟后）
+    if (retryLaterCount > 0) {
+      console.log('[Queue] Waiting 1 minute before retrying failed items...');
+      await sleep(60000);
+      
+      let retryProcessed = 0;
+      let retryFailed = 0;
+      let retryBatches = 0;
+
+      while (true) {
+        const current = await env.LINKS_KV.get('cached_aggregate');
+        if (!current) break;
+
+        const lines = current.split('\n');
+        const retryItems = [];
+
+        for (let i = 0; i < lines.length && retryItems.length < MAX_BATCH; i++) {
+          const line = lines[i];
+          if (line.endsWith('#分析失败-待重试')) {
+            const contentWithoutMark = line.slice(0, -8); // 去掉 #分析失败-待重试
+            const ip = extractIp(contentWithoutMark);
+            if (ip) {
+              retryItems.push({ index: i, line: contentWithoutMark, ip });
+            } else {
+              lines[i] = contentWithoutMark;
+            }
+          }
+        }
+
+        if (retryItems.length === 0) break;
+
+        for (const item of retryItems) {
+          // 重试时清除缓存，强制重新查询
+          const cleanIp = item.ip.split(':')[0].trim();
+          ipCache.delete(cleanIp);
+
+          let location;
+          try {
+            location = await getIpLocation(item.ip);
+          } catch (e) {
+            console.error(`[Queue Retry] Exception querying ${item.ip}:`, e.message);
+            location = 'UN未知';
+          }
+
+          if (location === 'UN未知' || location === '分析失败') {
+            // 重试仍然失败，标记为最终 #分析失败
+            lines[item.index] = `${item.line}#分析失败`;
+            retryFailed++;
+            console.log(`[Queue Retry] Final fail for ${item.ip}: all APIs exhausted after retry`);
+          } else {
+            lines[item.index] = `${item.line}#${location}`;
+            retryProcessed++;
+            console.log(`[Queue Retry] Success for ${item.ip}: ${location}`);
+          }
+        }
+
+        await env.LINKS_KV.put('cached_aggregate', lines.join('\n'), { expirationTtl: 3600 });
+        retryBatches++;
+      }
+
+      console.log(`[Queue] Retry pass completed. Batches: ${retryBatches}, Processed: ${retryProcessed}, Failed: ${retryFailed}`);
+    }
+
+    console.log(`[Queue] All done. Total processed: ${processedCount + retryProcessed}, Total failed: ${retryFailed}, Skipped: ${skippedCount}`);
   } catch (e) {
     console.error('[Queue] Error in processIpQueue:', e.message);
   }
+}
+
+// 睡眠辅助函数
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // ==================== /fetch 端点（直接返回当前缓存） ====================
