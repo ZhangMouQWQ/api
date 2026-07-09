@@ -178,7 +178,7 @@ async function aggregateLinks(env) {
         retryQueue.push({ index: i, ip, originalLine: line });
         processedLines[i] = line; // 暂时保持原样，不添加注释
       } else {
-        processedLines[i] = `${line} #${location}`;
+        processedLines[i] = `${line}#${location}`;
       }
     } else {
       processedLines[i] = line;
@@ -194,9 +194,9 @@ async function aggregateLinks(env) {
       const location = await getIpLocation(item.ip);
       
       if (location === 'UN未知') {
-        processedLines[item.index] = `${item.originalLine} #UN未知`;
+        processedLines[item.index] = `${item.originalLine}#UN未知`;
       } else {
-        processedLines[item.index] = `${item.originalLine} #${location}`;
+        processedLines[item.index] = `${item.originalLine}#${location}`;
         console.log(`[Retry] Success for ${cleanIp}: ${location}`);
       }
     }
