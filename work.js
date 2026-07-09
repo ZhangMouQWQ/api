@@ -45,7 +45,7 @@ async function handleRequest(request, env, ctx) {
   }
 
   if (url.pathname === '/fetch') {
-    return handleFetchTrigger(env, corsHeaders, ctx);
+    return handleFetchResult(env, corsHeaders);
   }
 
   if (url.pathname === '/status') {
@@ -61,7 +61,7 @@ async function handleRequest(request, env, ctx) {
     if (isBrowser) {
       return handleAdmin(env);
     } else {
-      return handleFetchTrigger(env, corsHeaders, ctx);
+      return handleFetchResult(env, corsHeaders);
     }
   }
 
@@ -202,13 +202,13 @@ function extractIp(line) {
   return null;
 }
 
-// /fetch 触发入口：立即返回空，后台执行处理
-async function handleFetchTrigger(env, corsHeaders, ctx) {
-  // 检查是否正在处理中
-  const processing = await env.LINKS_KV.get('fetch_processing');
-  if (processing === '1') {
+// /fetch 结果获取：直接返回已保存的结果，不触发任务
+async function handleFetchResult(env, corsHeaders) {
+  const lastResult = await env.LINKS_KV.get('last_result');
+  
+  if (!lastResult) {
     return new Response('', {
-      status: 202,
+      status: 204,
       headers: {
         ...corsHeaders,
         'Content-Type': 'text/plain; charset=utf-8',
@@ -216,17 +216,9 @@ async function handleFetchTrigger(env, corsHeaders, ctx) {
       }
     });
   }
-
-  // 标记处理中
-  await env.LINKS_KV.put('fetch_processing', '1');
-  await env.LINKS_KV.put('fetch_processing_start', new Date().toISOString());
-
-  // 后台执行实际处理（使用 ctx.waitUntil 保证即使 Response 已返回也继续执行）
-  ctx.waitUntil(runFetchProcess(env));
-
-  // 立即返回空内容
-  return new Response('', {
-    status: 202,
+  
+  return new Response(lastResult, {
+    status: 200,
     headers: {
       ...corsHeaders,
       'Content-Type': 'text/plain; charset=utf-8',
@@ -525,8 +517,9 @@ async function handleAdmin(env) {
     <h1>🔗 链接聚合管理</h1>
     
     <div class="info">
-      <strong>API 端点：</strong>程序请访问 <code>/fetch</code> 触发聚合，稍后通过 <code>/status</code> 查询状态<br>
-      <strong>智能访问：</strong>直接 curl 根域名也会触发聚合任务<br>
+      <strong>API 端点：</strong>程序请访问 <code>/fetch</code> 获取已聚合的结果（无结果时返回空）<br>
+      <strong>状态查询：</strong>访问 <code>/status</code> 查询处理状态和最近一次完成时间<br>
+      <strong>智能访问：</strong>直接 curl 根域名也会返回聚合结果<br>
       <strong>自动去重：</strong>多个链接返回的相同内容会自动去重，保留首次出现的顺序<br>
       <strong>自动更新：</strong>每整半小时自动触发后台聚合，新结果完成后替换旧结果（处理中保留旧内容）
     </div>
@@ -536,7 +529,6 @@ async function handleAdmin(env) {
       <span>最近一次完成结果时间：</span>
       <span class="time" id="lastTime">加载中...</span>
       <span class="processing" id="processingTag">⏳ 处理中...</span>
-      <button class="trigger-btn" id="triggerBtn" onclick="triggerFetch()">立即触发 /fetch</button>
     </div>
     
     <p>在下方输入框中填写链接，每行一个：</p>
@@ -552,8 +544,8 @@ async function handleAdmin(env) {
       <ul>
         <li>每行只能填写一个链接</li>
         <li>以 <code>#</code> 开头的行会被视为注释，跳过不处理</li>
-        <li>点击"立即触发 /fetch"或访问 <code>/fetch</code> 时，后台开始聚合所有链接内容</li>
-        <li>触发后会立即返回空响应，处理完成后结果保存到后台</li>
+        <li>访问 <code>/fetch</code> 时，直接返回最近一次已完成的聚合结果（无结果时返回空）</li>
+        <li>结果由定时任务每整半小时自动更新，新结果完成后替换旧结果</li>
         <li>获取到的内容会自动删除每行原有的 <code>#</code> 后的文字（包括 <code>#</code> 本身）</li>
         <li>多个链接返回的<strong>相同内容会自动去重</strong>，保留首次出现的顺序</li>
         <li><strong>新增：</strong>自动识别每行中的 IP 地址，并在末尾追加 <code>#国家简拼国家名</code> 的地区信息</li>
@@ -593,24 +585,6 @@ async function handleAdmin(env) {
       }
       
       status.style.display = 'block';
-      btn.disabled = false;
-    }
-    
-    // 触发 /fetch 请求
-    async function triggerFetch() {
-      const btn = document.getElementById('triggerBtn');
-      btn.disabled = true;
-      
-      try {
-        const res = await fetch('/fetch', { method: 'GET' });
-        if (res.status === 202) {
-          // 已接受，后台处理中
-          document.getElementById('processingTag').classList.add('active');
-        }
-      } catch (e) {
-        alert('触发失败: ' + e.message);
-      }
-      
       btn.disabled = false;
     }
     
