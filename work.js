@@ -10,16 +10,12 @@ export default {
       );
     }
   },
-
-  // 整点半自动触发聚合（需在 wrangler.toml 配置 crons = ["*/30 * * * *"]）
   async scheduled(event, env, ctx) {
+    // 定时触发器：每整半小时自动执行 fetch 聚合
     try {
-      console.log('[Scheduled] Aggregation started at', new Date().toISOString());
-      const output = await aggregateLinks(env);
-      await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: 3600 });
-      console.log('[Scheduled] Aggregation completed, cached successfully.');
+      await autoFetchAndStore(env);
     } catch (e) {
-      console.error('[Scheduled] Aggregation failed:', e.message);
+      console.error('Scheduled fetch error:', e);
     }
   }
 };
@@ -52,6 +48,10 @@ async function handleRequest(request, env) {
     return handleFetch(env, corsHeaders);
   }
 
+  if (url.pathname === '/status') {
+    return handleStatus(env, corsHeaders);
+  }
+
   if (url.pathname === '/' || url.pathname === '') {
     const accept = request.headers.get('Accept') || '';
     const userAgent = request.headers.get('User-Agent') || '';
@@ -82,15 +82,6 @@ async function handleSave(request, env, corsHeaders) {
     }
     
     await env.LINKS_KV.put('links', links);
-    
-    // 保存后自动刷新缓存
-    try {
-      const output = await aggregateLinks(env);
-      await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: 3600 });
-    } catch (e) {
-      console.error('Auto refresh after save failed:', e.message);
-    }
-    
     return new Response('OK', { 
       status: 200,
       headers: { ...corsHeaders, 'Content-Type': 'text/plain' }
@@ -102,161 +93,6 @@ async function handleSave(request, env, corsHeaders) {
     });
   }
 }
-
-// ==================== 核心聚合逻辑（抽离为独立函数） ====================
-
-async function aggregateLinks(env) {
-  const links = await env.LINKS_KV.get('links');
-  if (!links || !links.trim()) {
-    throw new Error('No links configured. Please open this page in browser and add links first.');
-  }
-  
-  const urls = links.split('\n')
-    .map(l => l.trim())
-    .filter(l => l && !l.startsWith('#'));
-  
-  if (urls.length === 0) {
-    throw new Error('No valid links found (all lines are empty or comments).');
-  }
-
-  const seen = new Set();
-  const allLines = [];
-  let successCount = 0;
-  const errors = [];
-
-  // 1. 拉取所有上游链接（带超时）
-  for (const url of urls) {
-    try {
-      const response = await fetchWithTimeout(url, {
-        headers: { 
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        },
-        cf: { cacheTtl: 60 }
-      }, 8000);
-      
-      if (!response.ok) {
-        errors.push(`# Error: HTTP ${response.status} for ${url}`);
-        continue;
-      }
-      
-      const text = await response.text();
-      successCount++;
-      
-      const lines = text.split('\n');
-      for (const line of lines) {
-        const idx = line.indexOf('#');
-        const processed = idx >= 0 ? line.substring(0, idx).trim() : line.trim();
-        
-        if (processed && !seen.has(processed)) {
-          seen.add(processed);
-          allLines.push(processed);
-        }
-      }
-    } catch (e) {
-      errors.push(`# Error fetching ${url}: ${e.message}`);
-    }
-  }
-
-  if (successCount === 0) {
-    const errorOutput = errors.join('\n') || 'All links failed';
-    throw new Error(errorOutput);
-  }
-
-  // 2. IP 归属地标注（两轮机制：先查询，失败则入队重试）
-  const processedLines = new Array(allLines.length);
-  const retryQueue = []; // { index, ip, originalLine }
-
-  // 第一轮：常规查询
-  for (let i = 0; i < allLines.length; i++) {
-    const line = allLines[i];
-    const ip = extractIp(line);
-    
-    if (ip) {
-      const location = await getIpLocation(ip);
-      if (location === 'UN未知') {
-        // 查询失败，跳过标注，加入重试队列
-        retryQueue.push({ index: i, ip, originalLine: line });
-        processedLines[i] = line; // 暂时保持原样，不添加注释
-      } else {
-        processedLines[i] = `${line}#${location}`;
-      }
-    } else {
-      processedLines[i] = line;
-    }
-  }
-
-  // 第二轮：对未成功的 IP 重新查询
-  if (retryQueue.length > 0) {
-    console.log(`[Retry] ${retryQueue.length} IPs need retry...`);
-    for (const item of retryQueue) {
-      const cleanIp = item.ip.split(':')[0].trim();
-      ipCache.delete(cleanIp); // 清除缓存，强制重新走 API
-      const location = await getIpLocation(item.ip);
-      
-      if (location === 'UN未知') {
-        processedLines[item.index] = `${item.originalLine}#UN未知`;
-      } else {
-        processedLines[item.index] = `${item.originalLine}#${location}`;
-        console.log(`[Retry] Success for ${cleanIp}: ${location}`);
-      }
-    }
-  }
-
-  // 3. 组装输出
-  let output = processedLines.join('\n');
-  if (errors.length > 0) {
-    output += '\n\n' + errors.join('\n');
-  }
-
-  return output;
-}
-
-// ==================== /fetch 端点（优先读缓存） ====================
-
-async function handleFetch(env, corsHeaders) {
-  // 优先返回缓存结果
-  try {
-    const cached = await env.LINKS_KV.get('cached_aggregate');
-    if (cached && cached.trim() !== '') {
-      return new Response(cached, {
-        headers: { 
-          ...corsHeaders, 
-          'Content-Type': 'text/plain; charset=utf-8',
-          'Cache-Control': 'no-cache',
-          'X-Cache-Status': 'HIT'
-        }
-      });
-    }
-  } catch (e) {
-    console.error('Cache read error:', e.message);
-  }
-  
-  // 缓存未命中，实时聚合
-  try {
-    const output = await aggregateLinks(env);
-    // 实时聚合成功后写入缓存
-    try {
-      await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: 3600 });
-    } catch (e) {
-      console.error('Cache write error:', e.message);
-    }
-    return new Response(output, {
-      headers: { 
-        ...corsHeaders, 
-        'Content-Type': 'text/plain; charset=utf-8',
-        'Cache-Control': 'no-cache',
-        'X-Cache-Status': 'MISS'
-      }
-    });
-  } catch (e) {
-    return new Response(e.message, { 
-      status: 502,
-      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
-    });
-  }
-}
-
-// ==================== IP 查询相关（保持原有逻辑） ====================
 
 // IP 缓存，避免重复查询
 const ipCache = new Map();
@@ -284,21 +120,7 @@ const countryCodeMap = {
   'YE': '也门', 'MO': '澳门'
 };
 
-// 带超时的 fetch 包装器
-async function fetchWithTimeout(url, options = {}, timeoutMs = 5000) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, { ...options, signal: controller.signal });
-    clearTimeout(timeoutId);
-    return response;
-  } catch (e) {
-    clearTimeout(timeoutId);
-    throw e;
-  }
-}
-
-// 查询 IP 地区信息（使用 uapis.cn 作为首选接口）
+// 查询 IP 地区信息（仅使用 uapis.cn 主接口）
 async function getIpLocation(ip) {
   // 清理 IP（去掉端口等）
   const cleanIp = ip.split(':')[0].trim();
@@ -308,117 +130,70 @@ async function getIpLocation(ip) {
     return ipCache.get(cleanIp);
   }
   
-  // 依次尝试多个 API
-  const apis = [
-    // uapis.cn - 首选，返回中文地区信息更完整
-    async () => {
-      const response = await fetchWithTimeout(`https://uapis.cn/api/v1/network/ipinfo?ip=${cleanIp}`, {
-        cf: { cacheTtl: 86400 }
-      }, 3000);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = await response.json();
-      if (data.region) {
-        const region = data.region.trim();
-        if (region) {
-          let code = 'UN';
-          for (const [k, v] of Object.entries(countryCodeMap)) {
-            if (region.includes(v)) {
-              code = k;
-              break;
-            }
+  try {
+    const response = await fetch(`https://uapis.cn/api/v1/network/ipinfo?ip=${cleanIp}`, {
+      cf: { cacheTtl: 86400 }
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    // region 可能是 "中国 上海 浦东"、"美国  "、或 "  "（空格）
+    if (data.region) {
+      const region = data.region.trim();
+      if (region) {
+        // 提取国家代码
+        let code = 'UN';
+        for (const [k, v] of Object.entries(countryCodeMap)) {
+          if (region.includes(v)) {
+            code = k;
+            break;
           }
-          if (code === 'UN') {
-            if (/^(美国|USA?|United States)/.test(region)) code = 'US';
-            else if (/^(日本|Japan|JP)/.test(region)) code = 'JP';
-            else if (/^(韩国|Korea|KR)/.test(region)) code = 'KR';
-            else if (/^(新加坡|Singapore|SG)/.test(region)) code = 'SG';
-            else if (/^(香港|Hong Kong|HK)/.test(region)) code = 'HK';
-            else if (/^(台湾|Taiwan|TW)/.test(region)) code = 'TW';
-            else if (/^(英国|United Kingdom|GB|UK)/.test(region)) code = 'GB';
-            else if (/^(德国|Germany|DE)/.test(region)) code = 'DE';
-            else if (/^(法国|France|FR)/.test(region)) code = 'FR';
-            else if (/^(俄罗斯|Russia|RU)/.test(region)) code = 'RU';
-            else if (/^(加拿大|Canada|CA)/.test(region)) code = 'CA';
-            else if (/^(澳大利亚|Australia|AU)/.test(region)) code = 'AU';
-            else if (/^(中国|China|CN)/.test(region)) code = 'CN';
-          }
-          const countryName = countryCodeMap[code] || region.split(/\s+/)[0];
-          return `${code}${countryName}`;
         }
+        // 如果无法匹配，根据常见特征判断
+        if (code === 'UN') {
+          if (/^(美国|USA?|United States)/.test(region)) code = 'US';
+          else if (/^(日本|Japan|JP)/.test(region)) code = 'JP';
+          else if (/^(韩国|Korea|KR)/.test(region)) code = 'KR';
+          else if (/^(新加坡|Singapore|SG)/.test(region)) code = 'SG';
+          else if (/^(香港|Hong Kong|HK)/.test(region)) code = 'HK';
+          else if (/^(台湾|Taiwan|TW)/.test(region)) code = 'TW';
+          else if (/^(英国|United Kingdom|GB|UK)/.test(region)) code = 'GB';
+          else if (/^(德国|Germany|DE)/.test(region)) code = 'DE';
+          else if (/^(法国|France|FR)/.test(region)) code = 'FR';
+          else if (/^(俄罗斯|Russia|RU)/.test(region)) code = 'RU';
+          else if (/^(加拿大|Canada|CA)/.test(region)) code = 'CA';
+          else if (/^(澳大利亚|Australia|AU)/.test(region)) code = 'AU';
+          else if (/^(中国|China|CN)/.test(region)) code = 'CN';
+        }
+        // 返回格式：代码 + 国家名（从映射表取，不在映射表则取region第一部分）
+        const countryName = countryCodeMap[code] || region.split(/\s+/)[0];
+        const result = `${code}${countryName}`;
+        ipCache.set(cleanIp, result);
+        return result;
       }
-      throw new Error('No region data');
-    },
-    // ipapi.co - 备选
-    async () => {
-      const response = await fetchWithTimeout(`https://ipapi.co/${cleanIp}/json/`, {
-        cf: { cacheTtl: 86400 }
-      }, 3000);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = await response.json();
-      if (data.country_code) {
-        const code = data.country_code;
-        return `${code}${countryCodeMap[code] || data.country_name || '未知'}`;
-      }
-      throw new Error('No country data');
-    },
-    // ipinfo.io - 备选
-    async () => {
-      const response = await fetchWithTimeout(`https://ipinfo.io/${cleanIp}/json`, {
-        cf: { cacheTtl: 86400 }
-      }, 3000);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = await response.json();
-      if (data.country) {
-        const code = data.country;
-        return `${code}${countryCodeMap[code] || '未知'}`;
-      }
-      throw new Error('No country data');
-    },
-    // ip-api.com - 最后备选
-    async () => {
-      const response = await fetchWithTimeout(`http://ip-api.com/json/${cleanIp}?fields=status,country,countryCode,message&lang=zh-CN`, {
-        cf: { cacheTtl: 86400 }
-      }, 3000);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = await response.json();
-      if (data.status === 'success' && data.countryCode) {
-        const code = data.countryCode;
-        return `${code}${countryCodeMap[code] || data.country || '未知'}`;
-      }
-      throw new Error(data.message || 'API failed');
     }
-  ];
-  
-  for (const api of apis) {
-    try {
-      const result = await api();
-      if (result === 'UN未知') {
-        continue;
-      }
-      ipCache.set(cleanIp, result);
-      return result;
-    } catch (e) {
-      continue;
-    }
+    throw new Error('No region data');
+  } catch (e) {
+    const result = 'UN未知';
+    ipCache.set(cleanIp, result);
+    return result;
   }
-  
-  const result = 'UN未知';
-  ipCache.set(cleanIp, result);
-  return result;
 }
 
 // 从行中提取 IP 地址
 function extractIp(line) {
+  // 匹配 IPv4 地址
   const ipv4Match = line.match(/\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(:\d+)?\b/);
   if (ipv4Match) {
     return ipv4Match[1] + (ipv4Match[2] || '');
   }
   
+  // 匹配 IPv6 地址（简化匹配，匹配方括号包裹的 IPv6）
   const ipv6Match = line.match(/\[([0-9a-fA-F:]+)\]/);
   if (ipv6Match) {
     return ipv6Match[1];
   }
   
+  // 匹配裸 IPv6 地址（至少包含两个冒号）
   const ipv6BareMatch = line.match(/\b([0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){2,})\b/);
   if (ipv6BareMatch) {
     return ipv6BareMatch[1];
@@ -427,16 +202,166 @@ function extractIp(line) {
   return null;
 }
 
-// ==================== 管理后台 HTML ====================
+async function handleFetch(env, corsHeaders) {
+  const links = await env.LINKS_KV.get('links');
+  if (!links || !links.trim()) {
+    return new Response('No links configured. Please open this page in browser and add links first.', { 
+      status: 404,
+      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+    });
+  }
+  
+  const urls = links.split('\n')
+    .map(l => l.trim())
+    .filter(l => l && !l.startsWith('#'));
+  
+  if (urls.length === 0) {
+    return new Response('No valid links found (all lines are empty or comments).', { 
+      status: 404,
+      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+    });
+  }
+
+  const seen = new Set();
+  const allLines = [];
+  let successCount = 0;
+  const errors = [];
+
+  for (const url of urls) {
+    try {
+      const response = await fetch(url, {
+        headers: { 
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        },
+        cf: { cacheTtl: 60 }
+      });
+      
+      if (!response.ok) {
+        errors.push(`# Error: HTTP ${response.status} for ${url}`);
+        continue;
+      }
+      
+      const text = await response.text();
+      successCount++;
+      
+      const lines = text.split('\n');
+      for (const line of lines) {
+        const idx = line.indexOf('#');
+        const processed = idx >= 0 ? line.substring(0, idx).trim() : line.trim();
+        
+        if (processed && !seen.has(processed)) {
+          seen.add(processed);
+          allLines.push(processed);
+        }
+      }
+    } catch (e) {
+      errors.push(`# Error fetching ${url}: ${e.message}`);
+    }
+  }
+
+  if (successCount === 0) {
+    const errorOutput = errors.join('\n') || 'All links failed';
+    return new Response(errorOutput, { 
+      status: 502,
+      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+    });
+  }
+
+  // 队列方式处理 IP 地区查询：失败则跳过，记录失败项
+  const processedLines = [];
+  const failedIps = []; // { line, ip }
+
+  for (const line of allLines) {
+    const ip = extractIp(line);
+    if (ip) {
+      try {
+        const location = await getIpLocation(ip);
+        if (location === 'UN未知') {
+          // 标记为失败，稍后重试
+          failedIps.push({ line, ip });
+          processedLines.push(`${line} #${location}`);
+        } else {
+          processedLines.push(`${line} #${location}`);
+        }
+      } catch (e) {
+        failedIps.push({ line, ip });
+        processedLines.push(`${line} #UN未知`);
+      }
+    } else {
+      processedLines.push(line);
+    }
+  }
+
+  // 队列完成后，重新请求之前失败的 IP
+  if (failedIps.length > 0) {
+    for (const item of failedIps) {
+      try {
+        // 清除缓存，强制重新查询
+        const cleanIp = item.ip.split(':')[0].trim();
+        ipCache.delete(cleanIp);
+        const location = await getIpLocation(item.ip);
+        // 更新对应行
+        const idx = processedLines.findIndex(pl => pl.startsWith(item.line + ' #'));
+        if (idx >= 0) {
+          processedLines[idx] = `${item.line} #${location}`;
+        }
+      } catch (e) {
+        // 重试失败，保持原样
+      }
+    }
+  }
+
+  let output = processedLines.join('\n');
+  if (errors.length > 0) {
+    output += '\n\n' + errors.join('\n');
+  }
+
+  // 保存结果和完成时间到 KV
+  await env.LINKS_KV.put('last_result', output);
+  await env.LINKS_KV.put('last_result_time', new Date().toISOString());
+
+  return new Response(output, {
+    headers: { 
+      ...corsHeaders, 
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Cache-Control': 'no-cache'
+    }
+  });
+}
+
+// 自动定时获取并存储结果（供 Cron Trigger 调用）
+async function autoFetchAndStore(env) {
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+  };
+  // 调用 handleFetch 但不返回 Response，只保存结果
+  const result = await handleFetch(env, corsHeaders);
+  // handleFetch 内部已经保存到 KV，这里只需读取确认
+  console.log('Auto fetch completed, status:', result.status);
+}
+
+// 返回最近一次完成结果的状态
+async function handleStatus(env, corsHeaders) {
+  const lastTime = await env.LINKS_KV.get('last_result_time') || '';
+  const lastResult = await env.LINKS_KV.get('last_result') || '';
+  
+  const data = {
+    lastResultTime: lastTime,
+    hasResult: !!lastResult
+  };
+  
+  return new Response(JSON.stringify(data), {
+    headers: {
+      ...corsHeaders,
+      'Content-Type': 'application/json; charset=utf-8'
+    }
+  });
+}
 
 async function handleAdmin(env) {
   const existing = await env.LINKS_KV.get('links') || '';
-  const cached = await env.LINKS_KV.get('cached_aggregate');
-  let cacheInfo = '暂无缓存';
-  if (cached) {
-    const lines = cached.split('\n').filter(l => l.trim() && !l.startsWith('#')).length;
-    cacheInfo = `已缓存（约 ${lines} 条记录）`;
-  }
   
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -476,7 +401,7 @@ async function handleAdmin(env) {
       font-family: monospace;
       border: 1px solid #bbdefb;
     }
-    .cache-status {
+    .status-bar {
       background: #f3e5f5;
       padding: 12px 15px;
       border-radius: 8px;
@@ -487,9 +412,15 @@ async function handleAdmin(env) {
       align-items: center;
       gap: 8px;
     }
-    .cache-status::before {
-      content: "⏱";
-      font-size: 16px;
+    .status-bar .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #9c27b0;
+      display: inline-block;
+    }
+    .status-bar .time {
+      font-weight: 600;
     }
     textarea { 
       width: 100%; 
@@ -512,7 +443,6 @@ async function handleAdmin(env) {
       display: flex;
       gap: 10px;
       align-items: center;
-      flex-wrap: wrap;
     }
     button { 
       padding: 12px 28px; 
@@ -527,12 +457,6 @@ async function handleAdmin(env) {
     }
     button:hover { background: #1976d2; }
     button:disabled { background: #ccc; cursor: not-allowed; }
-    .refresh-btn {
-      background: #4caf50;
-    }
-    .refresh-btn:hover {
-      background: #388e3c;
-    }
     .status { 
       padding: 12px 16px; 
       border-radius: 8px;
@@ -552,18 +476,6 @@ async function handleAdmin(env) {
     .tips h3 { margin-top: 0; }
     .tips ul { margin: 10px 0; padding-left: 20px; }
     .tips li { margin: 6px 0; }
-    .badge {
-      display: inline-block;
-      padding: 2px 8px;
-      border-radius: 4px;
-      font-size: 12px;
-      font-weight: 600;
-      margin-left: 6px;
-    }
-    .badge-new {
-      background: #ff5722;
-      color: white;
-    }
   </style>
 </head>
 <body>
@@ -574,11 +486,14 @@ async function handleAdmin(env) {
       <strong>API 端点：</strong>程序请访问 <code>/fetch</code> 获取汇总后的内容<br>
       <strong>智能访问：</strong>直接 curl 根域名也会自动返回汇总内容<br>
       <strong>自动去重：</strong>多个链接返回的相同内容会自动去重，保留首次出现的顺序<br>
-      <strong>IP 地区分析：</strong>自动识别每行中的 IP 地址并标注所属国家（如 <code>#CN中国</code>）
+      <strong>IP 地区分析：</strong>自动识别每行中的 IP 地址并标注所属国家（如 <code>#CN中国</code>）<br>
+      <strong>自动更新：</strong>每整半小时自动请求更新结果
     </div>
-
-    <div class="cache-status">
-      <strong>缓存状态：</strong>${cacheInfo} &nbsp;|&nbsp; 每整半小时自动更新（00:00 / 00:30 / 01:00 ...）
+    
+    <div class="status-bar" id="statusBar">
+      <span class="dot"></span>
+      <span>最近一次完成结果时间：</span>
+      <span class="time" id="lastTime">加载中...</span>
     </div>
     
     <p>在下方输入框中填写链接，每行一个：</p>
@@ -586,7 +501,6 @@ async function handleAdmin(env) {
     
     <div class="button-row">
       <button onclick="save()" id="saveBtn">保存链接</button>
-      <button onclick="refreshCache()" id="refreshBtn" class="refresh-btn">立即刷新缓存</button>
       <div id="status" class="status"></div>
     </div>
     
@@ -595,13 +509,12 @@ async function handleAdmin(env) {
       <ul>
         <li>每行只能填写一个链接</li>
         <li>以 <code>#</code> 开头的行会被视为注释，跳过不处理</li>
-        <li>访问 <code>/fetch</code> 时，程序会优先返回缓存内容，响应速度极快</li>
+        <li>访问 <code>/fetch</code> 时，程序会自动获取所有链接内容并汇总</li>
         <li>获取到的内容会自动删除每行原有的 <code>#</code> 后的文字（包括 <code>#</code> 本身）</li>
         <li>多个链接返回的<strong>相同内容会自动去重</strong>，保留首次出现的顺序</li>
         <li><strong>新增：</strong>自动识别每行中的 IP 地址，并在末尾追加 <code>#国家简拼国家名</code> 的地区信息</li>
-        <li><span class="badge badge-new">NEW</span> <strong>IP 重试机制：</strong>若某 IP 首次查询归属地失败，会先跳过该 IP 继续处理其他行，待全部处理完成后重新查询失败的 IP，提高成功率</li>
-        <li><span class="badge badge-new">NEW</span> <strong>自动缓存：</strong>每整半小时自动聚合所有链接并更新缓存；保存链接后也会自动刷新缓存</li>
-        <li>示例输出：<code>192.168.1.1:8080#CN中国</code></li>
+        <li>示例输出：<code>192.168.1.1:8080 #CN中国</code></li>
+        <li><strong>新增：</strong>IP 查询改为队列模式，失败后自动重试，确保稳定性</li>
       </ul>
     </div>
   </div>
@@ -624,7 +537,7 @@ async function handleAdmin(env) {
         
         if (res.ok) {
           status.className = 'status success';
-          status.textContent = '✓ 保存成功，缓存已自动刷新';
+          status.textContent = '✓ 保存成功';
         } else {
           const text = await res.text();
           status.className = 'status error';
@@ -638,34 +551,29 @@ async function handleAdmin(env) {
       status.style.display = 'block';
       btn.disabled = false;
     }
-
-    async function refreshCache() {
-      const btn = document.getElementById('refreshBtn');
-      const status = document.getElementById('status');
-      
-      btn.disabled = true;
-      status.style.display = 'none';
-      status.textContent = '刷新中...';
-      status.className = 'status';
-      status.style.display = 'block';
-      
+    
+    // 加载最近一次完成结果时间
+    async function loadLastTime() {
       try {
-        const res = await fetch('/fetch');
+        const res = await fetch('/status');
         if (res.ok) {
-          status.className = 'status success';
-          status.textContent = '✓ 缓存刷新成功';
-        } else {
-          const text = await res.text();
-          status.className = 'status error';
-          status.textContent = '✗ 刷新失败: ' + text;
+          const data = await res.json();
+          const el = document.getElementById('lastTime');
+          if (data.lastResultTime) {
+            const date = new Date(data.lastResultTime);
+            el.textContent = date.toLocaleString('zh-CN');
+          } else {
+            el.textContent = '暂无记录';
+          }
         }
       } catch (e) {
-        status.className = 'status error';
-        status.textContent = '✗ 错误: ' + e.message;
+        document.getElementById('lastTime').textContent = '获取失败';
       }
-      
-      btn.disabled = false;
     }
+    
+    loadLastTime();
+    // 每 30 秒刷新一次时间显示
+    setInterval(loadLastTime, 30000);
   </script>
 </body>
 </html>`;
