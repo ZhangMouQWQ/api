@@ -9,6 +9,18 @@ export default {
         { status: 500, headers: { 'Content-Type': 'text/plain; charset=utf-8' } }
       );
     }
+  },
+
+  // 整点半自动触发聚合（需在 wrangler.toml 配置 crons = ["*/30 * * * *"]）
+  async scheduled(event, env, ctx) {
+    try {
+      console.log('[Scheduled] Aggregation started at', new Date().toISOString());
+      const output = await aggregateLinks(env);
+      await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: 3600 });
+      console.log('[Scheduled] Aggregation completed, cached successfully.');
+    } catch (e) {
+      console.error('[Scheduled] Aggregation failed:', e.message);
+    }
   }
 };
 
@@ -70,6 +82,15 @@ async function handleSave(request, env, corsHeaders) {
     }
     
     await env.LINKS_KV.put('links', links);
+    
+    // 保存后自动刷新缓存
+    try {
+      const output = await aggregateLinks(env);
+      await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: 3600 });
+    } catch (e) {
+      console.error('Auto refresh after save failed:', e.message);
+    }
+    
     return new Response('OK', { 
       status: 200,
       headers: { ...corsHeaders, 'Content-Type': 'text/plain' }
@@ -81,6 +102,153 @@ async function handleSave(request, env, corsHeaders) {
     });
   }
 }
+
+// ==================== 核心聚合逻辑（抽离为独立函数） ====================
+
+async function aggregateLinks(env) {
+  const links = await env.LINKS_KV.get('links');
+  if (!links || !links.trim()) {
+    throw new Error('No links configured. Please open this page in browser and add links first.');
+  }
+  
+  const urls = links.split('\n')
+    .map(l => l.trim())
+    .filter(l => l && !l.startsWith('#'));
+  
+  if (urls.length === 0) {
+    throw new Error('No valid links found (all lines are empty or comments).');
+  }
+
+  const seen = new Set();
+  const allLines = [];
+  let successCount = 0;
+  const errors = [];
+
+  // 1. 拉取所有上游链接
+  for (const url of urls) {
+    try {
+      const response = await fetch(url, {
+        headers: { 
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        },
+        cf: { cacheTtl: 60 }
+      });
+      
+      if (!response.ok) {
+        errors.push(`# Error: HTTP ${response.status} for ${url}`);
+        continue;
+      }
+      
+      const text = await response.text();
+      successCount++;
+      
+      const lines = text.split('\n');
+      for (const line of lines) {
+        const idx = line.indexOf('#');
+        const processed = idx >= 0 ? line.substring(0, idx).trim() : line.trim();
+        
+        if (processed && !seen.has(processed)) {
+          seen.add(processed);
+          allLines.push(processed);
+        }
+      }
+    } catch (e) {
+      errors.push(`# Error fetching ${url}: ${e.message}`);
+    }
+  }
+
+  if (successCount === 0) {
+    const errorOutput = errors.join('\n') || 'All links failed';
+    throw new Error(errorOutput);
+  }
+
+  // 2. IP 归属地标注（两轮机制：先查询，失败则入队重试）
+  const processedLines = new Array(allLines.length);
+  const retryQueue = []; // { index, ip, originalLine }
+
+  // 第一轮：常规查询
+  for (let i = 0; i < allLines.length; i++) {
+    const line = allLines[i];
+    const ip = extractIp(line);
+    
+    if (ip) {
+      const location = await getIpLocation(ip);
+      if (location === 'UN未知') {
+        // 查询失败，跳过标注，加入重试队列
+        retryQueue.push({ index: i, ip, originalLine: line });
+        processedLines[i] = line; // 暂时保持原样，不添加注释
+      } else {
+        processedLines[i] = `${line} #${location}`;
+      }
+    } else {
+      processedLines[i] = line;
+    }
+  }
+
+  // 第二轮：对未成功的 IP 重新查询
+  if (retryQueue.length > 0) {
+    console.log(`[Retry] ${retryQueue.length} IPs need retry...`);
+    for (const item of retryQueue) {
+      const cleanIp = item.ip.split(':')[0].trim();
+      ipCache.delete(cleanIp); // 清除缓存，强制重新走 API
+      const location = await getIpLocation(item.ip);
+      
+      if (location === 'UN未知') {
+        processedLines[item.index] = `${item.originalLine} #UN未知`;
+      } else {
+        processedLines[item.index] = `${item.originalLine} #${location}`;
+        console.log(`[Retry] Success for ${cleanIp}: ${location}`);
+      }
+    }
+  }
+
+  // 3. 组装输出
+  let output = processedLines.join('\n');
+  if (errors.length > 0) {
+    output += '\n\n' + errors.join('\n');
+  }
+
+  return output;
+}
+
+// ==================== /fetch 端点（优先读缓存） ====================
+
+async function handleFetch(env, corsHeaders) {
+  // 优先返回缓存结果（由定时任务或上次保存时生成）
+  const cached = await env.LINKS_KV.get('cached_aggregate');
+  if (cached !== null && cached.trim() !== '') {
+    return new Response(cached, {
+      headers: { 
+        ...corsHeaders, 
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'X-Cache-Status': 'HIT'
+      }
+    });
+  }
+  
+  // 缓存未命中（首次部署或缓存过期），实时聚合
+  try {
+    const output = await aggregateLinks(env);
+    // 实时聚合成功后也写入缓存
+    await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: 3600 });
+    return new Response(output, {
+      headers: { 
+        ...corsHeaders, 
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'X-Cache-Status': 'MISS'
+      }
+    });
+  } catch (e) {
+    return new Response(e.message, { 
+      status: 502,
+      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+    });
+  }
+}
+
+// ==================== IP 查询相关（保持原有逻辑） ====================
 
 // IP 缓存，避免重复查询
 const ipCache = new Map();
@@ -127,11 +295,9 @@ async function getIpLocation(ip) {
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
-      // region 可能是 "中国 上海 浦东"、"美国  "、或 "  "（空格）
       if (data.region) {
         const region = data.region.trim();
         if (region) {
-          // 提取国家代码
           let code = 'UN';
           for (const [k, v] of Object.entries(countryCodeMap)) {
             if (region.includes(v)) {
@@ -139,7 +305,6 @@ async function getIpLocation(ip) {
               break;
             }
           }
-          // 如果无法匹配，根据常见特征判断
           if (code === 'UN') {
             if (/^(美国|USA?|United States)/.test(region)) code = 'US';
             else if (/^(日本|Japan|JP)/.test(region)) code = 'JP';
@@ -155,7 +320,6 @@ async function getIpLocation(ip) {
             else if (/^(澳大利亚|Australia|AU)/.test(region)) code = 'AU';
             else if (/^(中国|China|CN)/.test(region)) code = 'CN';
           }
-          // 返回格式：代码 + 国家名（从映射表取，不在映射表则取region第一部分）
           const countryName = countryCodeMap[code] || region.split(/\s+/)[0];
           return `${code}${countryName}`;
         }
@@ -206,19 +370,16 @@ async function getIpLocation(ip) {
   for (const api of apis) {
     try {
       const result = await api();
-      // 如果结果仍然是 UN未知，继续尝试下一个 API
       if (result === 'UN未知') {
         continue;
       }
       ipCache.set(cleanIp, result);
       return result;
     } catch (e) {
-      // 继续尝试下一个 API
       continue;
     }
   }
   
-  // 所有 API 都失败
   const result = 'UN未知';
   ipCache.set(cleanIp, result);
   return result;
@@ -226,19 +387,16 @@ async function getIpLocation(ip) {
 
 // 从行中提取 IP 地址
 function extractIp(line) {
-  // 匹配 IPv4 地址
   const ipv4Match = line.match(/\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(:\d+)?\b/);
   if (ipv4Match) {
     return ipv4Match[1] + (ipv4Match[2] || '');
   }
   
-  // 匹配 IPv6 地址（简化匹配，匹配方括号包裹的 IPv6）
   const ipv6Match = line.match(/\[([0-9a-fA-F:]+)\]/);
   if (ipv6Match) {
     return ipv6Match[1];
   }
   
-  // 匹配裸 IPv6 地址（至少包含两个冒号）
   const ipv6BareMatch = line.match(/\b([0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){2,})\b/);
   if (ipv6BareMatch) {
     return ipv6BareMatch[1];
@@ -247,99 +405,16 @@ function extractIp(line) {
   return null;
 }
 
-async function handleFetch(env, corsHeaders) {
-  const links = await env.LINKS_KV.get('links');
-  if (!links || !links.trim()) {
-    return new Response('No links configured. Please open this page in browser and add links first.', { 
-      status: 404,
-      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
-    });
-  }
-  
-  const urls = links.split('\n')
-    .map(l => l.trim())
-    .filter(l => l && !l.startsWith('#'));
-  
-  if (urls.length === 0) {
-    return new Response('No valid links found (all lines are empty or comments).', { 
-      status: 404,
-      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
-    });
-  }
-
-  const seen = new Set();
-  const allLines = [];
-  let successCount = 0;
-  const errors = [];
-
-  for (const url of urls) {
-    try {
-      const response = await fetch(url, {
-        headers: { 
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        },
-        cf: { cacheTtl: 60 }
-      });
-      
-      if (!response.ok) {
-        errors.push(`# Error: HTTP ${response.status} for ${url}`);
-        continue;
-      }
-      
-      const text = await response.text();
-      successCount++;
-      
-      const lines = text.split('\n');
-      for (const line of lines) {
-        const idx = line.indexOf('#');
-        const processed = idx >= 0 ? line.substring(0, idx).trim() : line.trim();
-        
-        if (processed && !seen.has(processed)) {
-          seen.add(processed);
-          allLines.push(processed);
-        }
-      }
-    } catch (e) {
-      errors.push(`# Error fetching ${url}: ${e.message}`);
-    }
-  }
-
-  if (successCount === 0) {
-    const errorOutput = errors.join('\n') || 'All links failed';
-    return new Response(errorOutput, { 
-      status: 502,
-      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
-    });
-  }
-
-  // 为每行结果添加 IP 地区信息
-  const processedLines = [];
-  for (const line of allLines) {
-    const ip = extractIp(line);
-    if (ip) {
-      const location = await getIpLocation(ip);
-      processedLines.push(`${line} #${location}`);
-    } else {
-      processedLines.push(line);
-    }
-  }
-
-  let output = processedLines.join('\n');
-  if (errors.length > 0) {
-    output += '\n\n' + errors.join('\n');
-  }
-
-  return new Response(output, {
-    headers: { 
-      ...corsHeaders, 
-      'Content-Type': 'text/plain; charset=utf-8',
-      'Cache-Control': 'no-cache'
-    }
-  });
-}
+// ==================== 管理后台 HTML ====================
 
 async function handleAdmin(env) {
   const existing = await env.LINKS_KV.get('links') || '';
+  const cached = await env.LINKS_KV.get('cached_aggregate');
+  let cacheInfo = '暂无缓存';
+  if (cached !== null) {
+    const lines = cached.split('\n').filter(l => l.trim() && !l.startsWith('#')).length;
+    cacheInfo = `已缓存（约 ${lines} 条记录）`;
+  }
   
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -379,6 +454,21 @@ async function handleAdmin(env) {
       font-family: monospace;
       border: 1px solid #bbdefb;
     }
+    .cache-status {
+      background: #f3e5f5;
+      padding: 12px 15px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      font-size: 14px;
+      color: #6a1b9a;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .cache-status::before {
+      content: "⏱";
+      font-size: 16px;
+    }
     textarea { 
       width: 100%; 
       height: 350px; 
@@ -400,6 +490,7 @@ async function handleAdmin(env) {
       display: flex;
       gap: 10px;
       align-items: center;
+      flex-wrap: wrap;
     }
     button { 
       padding: 12px 28px; 
@@ -414,6 +505,12 @@ async function handleAdmin(env) {
     }
     button:hover { background: #1976d2; }
     button:disabled { background: #ccc; cursor: not-allowed; }
+    .refresh-btn {
+      background: #4caf50;
+    }
+    .refresh-btn:hover {
+      background: #388e3c;
+    }
     .status { 
       padding: 12px 16px; 
       border-radius: 8px;
@@ -433,6 +530,18 @@ async function handleAdmin(env) {
     .tips h3 { margin-top: 0; }
     .tips ul { margin: 10px 0; padding-left: 20px; }
     .tips li { margin: 6px 0; }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 600;
+      margin-left: 6px;
+    }
+    .badge-new {
+      background: #ff5722;
+      color: white;
+    }
   </style>
 </head>
 <body>
@@ -445,12 +554,17 @@ async function handleAdmin(env) {
       <strong>自动去重：</strong>多个链接返回的相同内容会自动去重，保留首次出现的顺序<br>
       <strong>IP 地区分析：</strong>自动识别每行中的 IP 地址并标注所属国家（如 <code>#CN中国</code>）
     </div>
+
+    <div class="cache-status">
+      <strong>缓存状态：</strong>${cacheInfo} &nbsp;|&nbsp; 每整半小时自动更新（00:00 / 00:30 / 01:00 ...）
+    </div>
     
     <p>在下方输入框中填写链接，每行一个：</p>
     <textarea id="links" placeholder="https://example.com/list1&#10;https://example.com/list2&#10;https://example.com/list3">${existing}</textarea>
     
     <div class="button-row">
       <button onclick="save()" id="saveBtn">保存链接</button>
+      <button onclick="refreshCache()" id="refreshBtn" class="refresh-btn">立即刷新缓存</button>
       <div id="status" class="status"></div>
     </div>
     
@@ -459,10 +573,12 @@ async function handleAdmin(env) {
       <ul>
         <li>每行只能填写一个链接</li>
         <li>以 <code>#</code> 开头的行会被视为注释，跳过不处理</li>
-        <li>访问 <code>/fetch</code> 时，程序会自动获取所有链接内容并汇总</li>
+        <li>访问 <code>/fetch</code> 时，程序会优先返回缓存内容，响应速度极快</li>
         <li>获取到的内容会自动删除每行原有的 <code>#</code> 后的文字（包括 <code>#</code> 本身）</li>
         <li>多个链接返回的<strong>相同内容会自动去重</strong>，保留首次出现的顺序</li>
         <li><strong>新增：</strong>自动识别每行中的 IP 地址，并在末尾追加 <code>#国家简拼国家名</code> 的地区信息</li>
+        <li><span class="badge badge-new">NEW</span> <strong>IP 重试机制：</strong>若某 IP 首次查询归属地失败，会先跳过该 IP 继续处理其他行，待全部处理完成后重新查询失败的 IP，提高成功率</li>
+        <li><span class="badge badge-new">NEW</span> <strong>自动缓存：</strong>每整半小时自动聚合所有链接并更新缓存；保存链接后也会自动刷新缓存</li>
         <li>示例输出：<code>192.168.1.1:8080 #CN中国</code></li>
       </ul>
     </div>
@@ -486,7 +602,7 @@ async function handleAdmin(env) {
         
         if (res.ok) {
           status.className = 'status success';
-          status.textContent = '✓ 保存成功';
+          status.textContent = '✓ 保存成功，缓存已自动刷新';
         } else {
           const text = await res.text();
           status.className = 'status error';
@@ -498,6 +614,34 @@ async function handleAdmin(env) {
       }
       
       status.style.display = 'block';
+      btn.disabled = false;
+    }
+
+    async function refreshCache() {
+      const btn = document.getElementById('refreshBtn');
+      const status = document.getElementById('status');
+      
+      btn.disabled = true;
+      status.style.display = 'none';
+      status.textContent = '刷新中...';
+      status.className = 'status';
+      status.style.display = 'block';
+      
+      try {
+        const res = await fetch('/fetch');
+        if (res.ok) {
+          status.className = 'status success';
+          status.textContent = '✓ 缓存刷新成功';
+        } else {
+          const text = await res.text();
+          status.className = 'status error';
+          status.textContent = '✗ 刷新失败: ' + text;
+        }
+      } catch (e) {
+        status.className = 'status error';
+        status.textContent = '✗ 错误: ' + e.message;
+      }
+      
       btn.disabled = false;
     }
   </script>
