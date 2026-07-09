@@ -2,7 +2,7 @@ export default {
   async fetch(request, env, ctx) {
     // 全局兜底：任何异常都返回可读信息，避免 1101
     try {
-      return await handleRequest(request, env);
+      return await handleRequest(request, env, ctx);
     } catch (e) {
       return new Response(
         `Worker Error: ${e.message}\n\nStack:\n${e.stack || 'none'}`, 
@@ -13,14 +13,14 @@ export default {
   async scheduled(event, env, ctx) {
     // 定时触发器：每整半小时自动执行 fetch 聚合
     try {
-      await autoFetchAndStore(env);
+      await runFetchProcess(env);
     } catch (e) {
       console.error('Scheduled fetch error:', e);
     }
   }
 };
 
-async function handleRequest(request, env) {
+async function handleRequest(request, env, ctx) {
   // 检查 KV 绑定
   if (!env || !env.LINKS_KV) {
     return new Response(
@@ -45,7 +45,7 @@ async function handleRequest(request, env) {
   }
 
   if (url.pathname === '/fetch') {
-    return handleFetch(env, corsHeaders);
+    return handleFetchTrigger(env, corsHeaders, ctx);
   }
 
   if (url.pathname === '/status') {
@@ -61,7 +61,7 @@ async function handleRequest(request, env) {
     if (isBrowser) {
       return handleAdmin(env);
     } else {
-      return handleFetch(env, corsHeaders);
+      return handleFetchTrigger(env, corsHeaders, ctx);
     }
   }
 
@@ -202,24 +202,66 @@ function extractIp(line) {
   return null;
 }
 
-async function handleFetch(env, corsHeaders) {
-  const links = await env.LINKS_KV.get('links');
-  if (!links || !links.trim()) {
-    return new Response('No links configured. Please open this page in browser and add links first.', { 
-      status: 404,
-      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+// /fetch 触发入口：立即返回空，后台执行处理
+async function handleFetchTrigger(env, corsHeaders, ctx) {
+  // 检查是否正在处理中
+  const processing = await env.LINKS_KV.get('fetch_processing');
+  if (processing === '1') {
+    return new Response('', {
+      status: 202,
+      headers: {
+        ...corsHeaders,
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-cache'
+      }
     });
   }
-  
+
+  // 标记处理中
+  await env.LINKS_KV.put('fetch_processing', '1');
+  await env.LINKS_KV.put('fetch_processing_start', new Date().toISOString());
+
+  // 后台执行实际处理（使用 ctx.waitUntil 保证即使 Response 已返回也继续执行）
+  ctx.waitUntil(runFetchProcess(env));
+
+  // 立即返回空内容
+  return new Response('', {
+    status: 202,
+    headers: {
+      ...corsHeaders,
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Cache-Control': 'no-cache'
+    }
+  });
+}
+
+// 实际执行 fetch 聚合和 IP 查询的异步流程
+async function runFetchProcess(env) {
+  try {
+    const result = await doFetchAndProcess(env);
+    await env.LINKS_KV.put('last_result', result);
+    await env.LINKS_KV.put('last_result_time', new Date().toISOString());
+  } catch (e) {
+    console.error('Fetch process error:', e);
+    // 失败时不删除旧内容，保持 last_result 不变
+  } finally {
+    await env.LINKS_KV.put('fetch_processing', '0');
+  }
+}
+
+// 核心处理逻辑：获取链接、聚合、IP 查询
+async function doFetchAndProcess(env) {
+  const links = await env.LINKS_KV.get('links');
+  if (!links || !links.trim()) {
+    throw new Error('No links configured');
+  }
+
   const urls = links.split('\n')
     .map(l => l.trim())
     .filter(l => l && !l.startsWith('#'));
-  
+
   if (urls.length === 0) {
-    return new Response('No valid links found (all lines are empty or comments).', { 
-      status: 404,
-      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
-    });
+    throw new Error('No valid links found');
   }
 
   const seen = new Set();
@@ -260,11 +302,7 @@ async function handleFetch(env, corsHeaders) {
   }
 
   if (successCount === 0) {
-    const errorOutput = errors.join('\n') || 'All links failed';
-    return new Response(errorOutput, { 
-      status: 502,
-      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
-    });
+    throw new Error('All links failed');
   }
 
   // 队列方式处理 IP 地区查询：失败则跳过，记录失败项
@@ -316,40 +354,21 @@ async function handleFetch(env, corsHeaders) {
     output += '\n\n' + errors.join('\n');
   }
 
-  // 保存结果和完成时间到 KV
-  await env.LINKS_KV.put('last_result', output);
-  await env.LINKS_KV.put('last_result_time', new Date().toISOString());
-
-  return new Response(output, {
-    headers: { 
-      ...corsHeaders, 
-      'Content-Type': 'text/plain; charset=utf-8',
-      'Cache-Control': 'no-cache'
-    }
-  });
-}
-
-// 自动定时获取并存储结果（供 Cron Trigger 调用）
-async function autoFetchAndStore(env) {
-  const corsHeaders = {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
-  };
-  // 调用 handleFetch 但不返回 Response，只保存结果
-  const result = await handleFetch(env, corsHeaders);
-  // handleFetch 内部已经保存到 KV，这里只需读取确认
-  console.log('Auto fetch completed, status:', result.status);
+  return output;
 }
 
 // 返回最近一次完成结果的状态
 async function handleStatus(env, corsHeaders) {
   const lastTime = await env.LINKS_KV.get('last_result_time') || '';
   const lastResult = await env.LINKS_KV.get('last_result') || '';
+  const processing = await env.LINKS_KV.get('fetch_processing') || '0';
+  const processingStart = await env.LINKS_KV.get('fetch_processing_start') || '';
   
   const data = {
     lastResultTime: lastTime,
-    hasResult: !!lastResult
+    hasResult: !!lastResult,
+    processing: processing === '1',
+    processingStart: processingStart
   };
   
   return new Response(JSON.stringify(data), {
@@ -410,7 +429,8 @@ async function handleAdmin(env) {
       color: #6a1b9a;
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 10px;
+      flex-wrap: wrap;
     }
     .status-bar .dot {
       width: 8px;
@@ -422,6 +442,28 @@ async function handleAdmin(env) {
     .status-bar .time {
       font-weight: 600;
     }
+    .status-bar .processing {
+      color: #e65100;
+      font-weight: 500;
+      display: none;
+    }
+    .status-bar .processing.active {
+      display: inline;
+    }
+    .status-bar .trigger-btn {
+      margin-left: auto;
+      padding: 6px 16px;
+      background: #4caf50;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      transition: all 0.2s;
+    }
+    .status-bar .trigger-btn:hover { background: #43a047; }
+    .status-bar .trigger-btn:disabled { background: #ccc; cursor: not-allowed; }
     textarea { 
       width: 100%; 
       height: 350px; 
@@ -483,17 +525,18 @@ async function handleAdmin(env) {
     <h1>🔗 链接聚合管理</h1>
     
     <div class="info">
-      <strong>API 端点：</strong>程序请访问 <code>/fetch</code> 获取汇总后的内容<br>
-      <strong>智能访问：</strong>直接 curl 根域名也会自动返回汇总内容<br>
+      <strong>API 端点：</strong>程序请访问 <code>/fetch</code> 触发聚合，稍后通过 <code>/status</code> 查询状态<br>
+      <strong>智能访问：</strong>直接 curl 根域名也会触发聚合任务<br>
       <strong>自动去重：</strong>多个链接返回的相同内容会自动去重，保留首次出现的顺序<br>
-      <strong>IP 地区分析：</strong>自动识别每行中的 IP 地址并标注所属国家（如 <code>#CN中国</code>）<br>
-      <strong>自动更新：</strong>每整半小时自动请求更新结果
+      <strong>自动更新：</strong>每整半小时自动触发后台聚合，新结果完成后替换旧结果（处理中保留旧内容）
     </div>
     
     <div class="status-bar" id="statusBar">
       <span class="dot"></span>
       <span>最近一次完成结果时间：</span>
       <span class="time" id="lastTime">加载中...</span>
+      <span class="processing" id="processingTag">⏳ 处理中...</span>
+      <button class="trigger-btn" id="triggerBtn" onclick="triggerFetch()">立即触发 /fetch</button>
     </div>
     
     <p>在下方输入框中填写链接，每行一个：</p>
@@ -509,7 +552,8 @@ async function handleAdmin(env) {
       <ul>
         <li>每行只能填写一个链接</li>
         <li>以 <code>#</code> 开头的行会被视为注释，跳过不处理</li>
-        <li>访问 <code>/fetch</code> 时，程序会自动获取所有链接内容并汇总</li>
+        <li>点击"立即触发 /fetch"或访问 <code>/fetch</code> 时，后台开始聚合所有链接内容</li>
+        <li>触发后会立即返回空响应，处理完成后结果保存到后台</li>
         <li>获取到的内容会自动删除每行原有的 <code>#</code> 后的文字（包括 <code>#</code> 本身）</li>
         <li>多个链接返回的<strong>相同内容会自动去重</strong>，保留首次出现的顺序</li>
         <li><strong>新增：</strong>自动识别每行中的 IP 地址，并在末尾追加 <code>#国家简拼国家名</code> 的地区信息</li>
@@ -552,18 +596,44 @@ async function handleAdmin(env) {
       btn.disabled = false;
     }
     
-    // 加载最近一次完成结果时间
-    async function loadLastTime() {
+    // 触发 /fetch 请求
+    async function triggerFetch() {
+      const btn = document.getElementById('triggerBtn');
+      btn.disabled = true;
+      
+      try {
+        const res = await fetch('/fetch', { method: 'GET' });
+        if (res.status === 202) {
+          // 已接受，后台处理中
+          document.getElementById('processingTag').classList.add('active');
+        }
+      } catch (e) {
+        alert('触发失败: ' + e.message);
+      }
+      
+      btn.disabled = false;
+    }
+    
+    // 加载状态信息
+    async function loadStatus() {
       try {
         const res = await fetch('/status');
         if (res.ok) {
           const data = await res.json();
-          const el = document.getElementById('lastTime');
+          const timeEl = document.getElementById('lastTime');
+          const procEl = document.getElementById('processingTag');
+          
           if (data.lastResultTime) {
             const date = new Date(data.lastResultTime);
-            el.textContent = date.toLocaleString('zh-CN');
+            timeEl.textContent = date.toLocaleString('zh-CN');
           } else {
-            el.textContent = '暂无记录';
+            timeEl.textContent = '暂无记录';
+          }
+          
+          if (data.processing) {
+            procEl.classList.add('active');
+          } else {
+            procEl.classList.remove('active');
           }
         }
       } catch (e) {
@@ -571,9 +641,9 @@ async function handleAdmin(env) {
       }
     }
     
-    loadLastTime();
-    // 每 30 秒刷新一次时间显示
-    setInterval(loadLastTime, 30000);
+    loadStatus();
+    // 每 10 秒刷新一次状态
+    setInterval(loadStatus, 10000);
   </script>
 </body>
 </html>`;
