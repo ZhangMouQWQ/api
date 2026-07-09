@@ -2,7 +2,7 @@ export default {
   async fetch(request, env, ctx) {
     // 全局兜底：任何异常都返回可读信息，避免 1101
     try {
-      return await handleRequest(request, env);
+      return await handleRequest(request, env, ctx);
     } catch (e) {
       return new Response(
         `Worker Error: ${e.message}\n\nStack:\n${e.stack || 'none'}`, 
@@ -15,7 +15,7 @@ export default {
   async scheduled(event, env, ctx) {
     try {
       console.log('[Scheduled] Aggregation started at', new Date().toISOString());
-      const output = await aggregateLinks(env);
+      const output = await aggregateLinks(env, ctx);
       await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: 3600 });
       console.log('[Scheduled] Aggregation completed, cached successfully.');
     } catch (e) {
@@ -24,7 +24,7 @@ export default {
   }
 };
 
-async function handleRequest(request, env) {
+async function handleRequest(request, env, ctx) {
   // 检查 KV 绑定
   if (!env || !env.LINKS_KV) {
     return new Response(
@@ -45,7 +45,7 @@ async function handleRequest(request, env) {
   }
 
   if (url.pathname === '/save' && request.method === 'POST') {
-    return handleSave(request, env, corsHeaders);
+    return handleSave(request, env, ctx, corsHeaders);
   }
 
   if (url.pathname === '/fetch') {
@@ -68,7 +68,7 @@ async function handleRequest(request, env) {
   return handleAdmin(env);
 }
 
-async function handleSave(request, env, corsHeaders) {
+async function handleSave(request, env, ctx, corsHeaders) {
   try {
     let links;
     const contentType = request.headers.get('content-type') || '';
@@ -83,9 +83,9 @@ async function handleSave(request, env, corsHeaders) {
     
     await env.LINKS_KV.put('links', links);
     
-    // 保存后自动刷新缓存
+    // 保存后自动刷新缓存（后台处理 IP）
     try {
-      const output = await aggregateLinks(env);
+      const output = await aggregateLinks(env, ctx);
       await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: 3600 });
     } catch (e) {
       console.error('Auto refresh after save failed:', e.message);
@@ -103,9 +103,9 @@ async function handleSave(request, env, corsHeaders) {
   }
 }
 
-// ==================== 核心聚合逻辑（抽离为独立函数） ====================
+// ==================== 核心聚合逻辑（两阶段：先快速缓存，后台处理 IP） ====================
 
-async function aggregateLinks(env) {
+async function aggregateLinks(env, ctx) {
   const links = await env.LINKS_KV.get('links');
   if (!links || !links.trim()) {
     throw new Error('No links configured. Please open this page in browser and add links first.');
@@ -162,62 +162,106 @@ async function aggregateLinks(env) {
     throw new Error(errorOutput);
   }
 
-  // 2. IP 归属地标注（两轮机制：先查询，失败则入队重试）
-  const processedLines = new Array(allLines.length);
-  const retryQueue = []; // { index, ip, originalLine }
-
-  // 第一轮：常规查询
-  for (let i = 0; i < allLines.length; i++) {
-    const line = allLines[i];
+  // 2. 给所有包含 IP 的行添加 #未处理 标记
+  const markedLines = allLines.map(line => {
     const ip = extractIp(line);
-    
     if (ip) {
-      const location = await getIpLocation(ip);
-      if (location === 'UN未知') {
-        // 查询失败，跳过标注，加入重试队列
-        retryQueue.push({ index: i, ip, originalLine: line });
-        processedLines[i] = line; // 暂时保持原样，不添加注释
-      } else {
-        processedLines[i] = `${line}#${location}`;
-      }
-    } else {
-      processedLines[i] = line;
+      return `${line}#未处理`;
     }
-  }
+    return line;
+  });
 
-  // 第二轮：对未成功的 IP 重新查询
-  if (retryQueue.length > 0) {
-    console.log(`[Retry] ${retryQueue.length} IPs need retry...`);
-    for (const item of retryQueue) {
-      const cleanIp = item.ip.split(':')[0].trim();
-      ipCache.delete(cleanIp); // 清除缓存，强制重新走 API
-      const location = await getIpLocation(item.ip);
-      
-      if (location === 'UN未知') {
-        processedLines[item.index] = `${item.originalLine}#UN未知`;
-      } else {
-        processedLines[item.index] = `${item.originalLine}#${location}`;
-        console.log(`[Retry] Success for ${cleanIp}: ${location}`);
-      }
-    }
-  }
-
-  // 3. 组装输出
-  let output = processedLines.join('\n');
+  // 3. 组装初始输出并立即写入缓存
+  let output = markedLines.join('\n');
   if (errors.length > 0) {
     output += '\n\n' + errors.join('\n');
+  }
+
+  // 立即写入缓存，让外部请求可以获取到（带 #未处理 标记）
+  await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: 3600 });
+
+  // 4. 启动后台任务：按队列处理 IP 归属地
+  if (ctx) {
+    ctx.waitUntil(processIpQueue(env));
   }
 
   return output;
 }
 
-// ==================== /fetch 端点（优先读缓存） ====================
+// ==================== 后台 IP 处理队列 ====================
+
+async function processIpQueue(env) {
+  try {
+    let hasMore = true;
+    let processedCount = 0;
+    let failedCount = 0;
+
+    while (hasMore) {
+      // 读取当前缓存
+      const current = await env.LINKS_KV.get('cached_aggregate');
+      if (!current) break;
+
+      const lines = current.split('\n');
+      let foundIndex = -1;
+      let foundLine = '';
+      let foundIp = '';
+
+      // 找到第一个带 #未处理 的行
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (line.endsWith('#未处理')) {
+          const contentWithoutMark = line.slice(0, -4); // 去掉末尾的 #未处理
+          const ip = extractIp(contentWithoutMark);
+          if (ip) {
+            foundIndex = i;
+            foundLine = contentWithoutMark;
+            foundIp = ip;
+            break;
+          } else {
+            // 有 #未处理 标记但提取不到 IP，移除标记
+            lines[i] = contentWithoutMark;
+          }
+        }
+      }
+
+      if (foundIndex === -1) {
+        hasMore = false;
+        break;
+      }
+
+      // 查询 IP 归属地
+      const location = await getIpLocation(foundIp);
+
+      if (location === 'UN未知' || location === '分析失败') {
+        // 所有 API 均失败
+        lines[foundIndex] = `${foundLine}#分析失败`;
+        failedCount++;
+        console.log(`[Queue] Failed for ${foundIp}: all APIs exhausted`);
+      } else {
+        // 成功
+        lines[foundIndex] = `${foundLine}#${location}`;
+        processedCount++;
+        console.log(`[Queue] Success for ${foundIp}: ${location}`);
+      }
+
+      // 写回缓存
+      const updated = lines.join('\n');
+      await env.LINKS_KV.put('cached_aggregate', updated, { expirationTtl: 3600 });
+    }
+
+    console.log(`[Queue] Completed. Processed: ${processedCount}, Failed: ${failedCount}`);
+  } catch (e) {
+    console.error('[Queue] Error in processIpQueue:', e.message);
+  }
+}
+
+// ==================== /fetch 端点（直接返回当前缓存） ====================
 
 async function handleFetch(env, corsHeaders) {
-  // 优先返回缓存结果
+  // 始终直接返回当前缓存内容（可能包含 #未处理、已完成分析、#分析失败 的混合状态）
   try {
     const cached = await env.LINKS_KV.get('cached_aggregate');
-    if (cached && cached.trim() !== '') {
+    if (cached !== null && cached !== undefined) {
       return new Response(cached, {
         headers: { 
           ...corsHeaders, 
@@ -231,15 +275,9 @@ async function handleFetch(env, corsHeaders) {
     console.error('Cache read error:', e.message);
   }
   
-  // 缓存未命中，实时聚合
+  // 缓存完全不存在，实时聚合（同步模式，无后台处理）
   try {
-    const output = await aggregateLinks(env);
-    // 实时聚合成功后写入缓存
-    try {
-      await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: 3600 });
-    } catch (e) {
-      console.error('Cache write error:', e.message);
-    }
+    const output = await aggregateLinks(env, null);
     return new Response(output, {
       headers: { 
         ...corsHeaders, 
@@ -434,8 +472,11 @@ async function handleAdmin(env) {
   const cached = await env.LINKS_KV.get('cached_aggregate');
   let cacheInfo = '暂无缓存';
   if (cached) {
-    const lines = cached.split('\n').filter(l => l.trim() && !l.startsWith('#')).length;
-    cacheInfo = `已缓存（约 ${lines} 条记录）`;
+    const totalLines = cached.split('\n').filter(l => l.trim() && !l.startsWith('#')).length;
+    const unprocessed = (cached.match(/#未处理/g) || []).length;
+    const failed = (cached.match(/#分析失败/g) || []).length;
+    const processed = totalLines - unprocessed - failed;
+    cacheInfo = `已缓存（约 ${totalLines} 条记录，已处理 ${processed}，未处理 ${unprocessed}，失败 ${failed}）`;
   }
   
   const html = `<!DOCTYPE html>
@@ -578,7 +619,7 @@ async function handleAdmin(env) {
     </div>
 
     <div class="cache-status">
-      <strong>缓存状态：</strong>${cacheInfo} &nbsp;|&nbsp; 每整半小时自动更新（00:00 / 00:30 / 01:00 ...）
+      <strong>缓存状态：</strong>${cacheInfo} &nbsp;|&nbsp; 每整半小时自动更新
     </div>
     
     <p>在下方输入框中填写链接，每行一个：</p>
@@ -599,9 +640,9 @@ async function handleAdmin(env) {
         <li>获取到的内容会自动删除每行原有的 <code>#</code> 后的文字（包括 <code>#</code> 本身）</li>
         <li>多个链接返回的<strong>相同内容会自动去重</strong>，保留首次出现的顺序</li>
         <li><strong>新增：</strong>自动识别每行中的 IP 地址，并在末尾追加 <code>#国家简拼国家名</code> 的地区信息</li>
-        <li><span class="badge badge-new">NEW</span> <strong>IP 重试机制：</strong>若某 IP 首次查询归属地失败，会先跳过该 IP 继续处理其他行，待全部处理完成后重新查询失败的 IP，提高成功率</li>
-        <li><span class="badge badge-new">NEW</span> <strong>自动缓存：</strong>每整半小时自动聚合所有链接并更新缓存；保存链接后也会自动刷新缓存</li>
-        <li>示例输出：<code>192.168.1.1:8080#CN中国</code></li>
+        <li><span class="badge badge-new">NEW</span> <strong>后台异步处理：</strong>时间触发器触发后，先快速返回带 <code>#未处理</code> 标记的结果，之后在后台逐个分析 IP 归属地，成功替换为实际地区，失败标记 <code>#分析失败</code></li>
+        <li><span class="badge badge-new">NEW</span> <strong>实时进度：</strong>后台处理期间，外部请求直接返回当前处理进度（已处理 / 未处理 / 分析失败）</li>
+        <li>示例输出：<code>192.168.1.1:8080#CN中国</code>、<code>1.2.3.4:443#未处理</code>、<code>5.6.7.8:80#分析失败</code></li>
       </ul>
     </div>
   </div>
@@ -624,7 +665,7 @@ async function handleAdmin(env) {
         
         if (res.ok) {
           status.className = 'status success';
-          status.textContent = '✓ 保存成功，缓存已自动刷新';
+          status.textContent = '✓ 保存成功，缓存已自动刷新（后台开始处理 IP）';
         } else {
           const text = await res.text();
           status.className = 'status error';
@@ -653,7 +694,7 @@ async function handleAdmin(env) {
         const res = await fetch('/fetch');
         if (res.ok) {
           status.className = 'status success';
-          status.textContent = '✓ 缓存刷新成功';
+          status.textContent = '✓ 缓存刷新成功（后台开始处理 IP）';
         } else {
           const text = await res.text();
           status.className = 'status error';
