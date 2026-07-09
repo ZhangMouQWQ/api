@@ -192,64 +192,85 @@ async function aggregateLinks(env, ctx) {
 
 async function processIpQueue(env) {
   try {
-    let hasMore = true;
     let processedCount = 0;
     let failedCount = 0;
+    let skippedCount = 0;
+    let batchCount = 0;
+    const MAX_BATCH = 10; // 每批处理 10 个 IP 再写回 KV，减少 KV 操作次数
 
-    while (hasMore) {
+    while (true) {
       // 读取当前缓存
       const current = await env.LINKS_KV.get('cached_aggregate');
       if (!current) break;
 
       const lines = current.split('\n');
-      let foundIndex = -1;
-      let foundLine = '';
-      let foundIp = '';
+      const pendingItems = [];
 
-      // 找到第一个带 #未处理 的行
-      for (let i = 0; i < lines.length; i++) {
+      // 收集本批次待处理的项（#未处理 或旧版 #UN未知）
+      for (let i = 0; i < lines.length && pendingItems.length < MAX_BATCH; i++) {
         const line = lines[i];
+        let contentWithoutMark = null;
+        let isUnknown = false;
+
         if (line.endsWith('#未处理')) {
-          const contentWithoutMark = line.slice(0, -4); // 去掉末尾的 #未处理
+          contentWithoutMark = line.slice(0, -4);
+        } else if (line.endsWith('#UN未知')) {
+          contentWithoutMark = line.slice(0, -5);
+          isUnknown = true;
+        }
+
+        if (contentWithoutMark !== null) {
           const ip = extractIp(contentWithoutMark);
           if (ip) {
-            foundIndex = i;
-            foundLine = contentWithoutMark;
-            foundIp = ip;
-            break;
+            pendingItems.push({ index: i, line: contentWithoutMark, ip, isUnknown });
           } else {
-            // 有 #未处理 标记但提取不到 IP，移除标记
+            // 提取不到 IP，移除标记
             lines[i] = contentWithoutMark;
+            skippedCount++;
           }
         }
       }
 
-      if (foundIndex === -1) {
-        hasMore = false;
+      if (pendingItems.length === 0) {
+        // 没有待处理项，检查是否有因 skipped 修改的行需要写回
+        if (skippedCount > 0 && batchCount === 0) {
+          await env.LINKS_KV.put('cached_aggregate', lines.join('\n'), { expirationTtl: 3600 });
+        }
         break;
       }
 
-      // 查询 IP 归属地
-      const location = await getIpLocation(foundIp);
+      // 批量查询 IP 归属地
+      for (const item of pendingItems) {
+        let location;
+        try {
+          // 清除缓存，强制重新查询（对旧版 #UN未知 尤其重要）
+          if (item.isUnknown) {
+            const cleanIp = item.ip.split(':')[0].trim();
+            ipCache.delete(cleanIp);
+          }
+          location = await getIpLocation(item.ip);
+        } catch (e) {
+          console.error(`[Queue] Exception querying ${item.ip}:`, e.message);
+          location = 'UN未知';
+        }
 
-      if (location === 'UN未知' || location === '分析失败') {
-        // 所有 API 均失败
-        lines[foundIndex] = `${foundLine}#分析失败`;
-        failedCount++;
-        console.log(`[Queue] Failed for ${foundIp}: all APIs exhausted`);
-      } else {
-        // 成功
-        lines[foundIndex] = `${foundLine}#${location}`;
-        processedCount++;
-        console.log(`[Queue] Success for ${foundIp}: ${location}`);
+        if (location === 'UN未知' || location === '分析失败') {
+          lines[item.index] = `${item.line}#分析失败`;
+          failedCount++;
+          console.log(`[Queue] Failed for ${item.ip}: all APIs exhausted`);
+        } else {
+          lines[item.index] = `${item.line}#${location}`;
+          processedCount++;
+          console.log(`[Queue] Success for ${item.ip}: ${location}`);
+        }
       }
 
-      // 写回缓存
-      const updated = lines.join('\n');
-      await env.LINKS_KV.put('cached_aggregate', updated, { expirationTtl: 3600 });
+      // 批量写回缓存
+      await env.LINKS_KV.put('cached_aggregate', lines.join('\n'), { expirationTtl: 3600 });
+      batchCount++;
     }
 
-    console.log(`[Queue] Completed. Processed: ${processedCount}, Failed: ${failedCount}`);
+    console.log(`[Queue] Completed. Batches: ${batchCount}, Processed: ${processedCount}, Failed: ${failedCount}, Skipped: ${skippedCount}`);
   } catch (e) {
     console.error('[Queue] Error in processIpQueue:', e.message);
   }
