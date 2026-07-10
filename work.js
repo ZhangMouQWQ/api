@@ -196,6 +196,7 @@ async function processIpQueue(env) {
     let failedCount = 0;
     let skippedCount = 0;
     let retryLaterCount = 0;
+    let deletedCount = 0;
     let batchCount = 0;
     const MAX_BATCH = 10; // 每批处理 10 个 IP 再写回 KV，减少 KV 操作次数
 
@@ -235,7 +236,8 @@ async function processIpQueue(env) {
       if (pendingItems.length === 0) {
         // 没有待处理项，检查是否有因 skipped 修改的行需要写回
         if (skippedCount > 0 && batchCount === 0) {
-          await env.LINKS_KV.put('cached_aggregate', lines.join('\n'), { expirationTtl: 3600 });
+          const filteredLines = lines.filter(line => line !== null);
+          await env.LINKS_KV.put('cached_aggregate', filteredLines.join('\n'), { expirationTtl: 3600 });
         }
         break;
       }
@@ -260,20 +262,26 @@ async function processIpQueue(env) {
           lines[item.index] = `${item.line}#分析失败-待重试`;
           retryLaterCount++;
           console.log(`[Queue] Failed for ${item.ip}: all APIs exhausted, will retry in 1 minute`);
+        } else if (location.startsWith('CN')) {
+          // 中国IP，删除该行
+          lines[item.index] = null;
+          deletedCount++;
+          console.log(`[Queue] Deleted ${item.ip}: China IP`);
         } else {
-          // 成功
+          // 成功且非中国IP
           lines[item.index] = `${item.line}#${location}`;
           processedCount++;
           console.log(`[Queue] Success for ${item.ip}: ${location}`);
         }
       }
 
-      // 批量写回缓存
-      await env.LINKS_KV.put('cached_aggregate', lines.join('\n'), { expirationTtl: 3600 });
+      // 批量写回缓存（过滤掉已删除的行）
+      const filteredLines = lines.filter(line => line !== null);
+      await env.LINKS_KV.put('cached_aggregate', filteredLines.join('\n'), { expirationTtl: 3600 });
       batchCount++;
     }
 
-    console.log(`[Queue] First pass completed. Batches: ${batchCount}, Processed: ${processedCount}, Failed: ${retryLaterCount}, Skipped: ${skippedCount}`);
+    console.log(`[Queue] First pass completed. Batches: ${batchCount}, Processed: ${processedCount}, Failed: ${retryLaterCount}, Deleted: ${deletedCount}, Skipped: ${skippedCount}`);
 
     // 第二轮：重试 #分析失败-待重试 的项（等待 1 分钟后）
     if (retryLaterCount > 0) {
@@ -282,6 +290,7 @@ async function processIpQueue(env) {
       
       let retryProcessed = 0;
       let retryFailed = 0;
+      let retryDeleted = 0;
       let retryBatches = 0;
 
       while (true) {
@@ -294,7 +303,7 @@ async function processIpQueue(env) {
         for (let i = 0; i < lines.length && retryItems.length < MAX_BATCH; i++) {
           const line = lines[i];
           if (line.endsWith('#分析失败-待重试')) {
-            const contentWithoutMark = line.slice(0, -8); // 去掉 #分析失败-待重试
+            const contentWithoutMark = line.slice(0, -9); // 去掉 #分析失败-待重试（9个字符）
             const ip = extractIp(contentWithoutMark);
             if (ip) {
               retryItems.push({ index: i, line: contentWithoutMark, ip });
@@ -324,6 +333,11 @@ async function processIpQueue(env) {
             lines[item.index] = `${item.line}#分析失败`;
             retryFailed++;
             console.log(`[Queue Retry] Final fail for ${item.ip}: all APIs exhausted after retry`);
+          } else if (location.startsWith('CN')) {
+            // 中国IP，删除该行
+            lines[item.index] = null;
+            retryDeleted++;
+            console.log(`[Queue Retry] Deleted ${item.ip}: China IP`);
           } else {
             lines[item.index] = `${item.line}#${location}`;
             retryProcessed++;
@@ -331,14 +345,15 @@ async function processIpQueue(env) {
           }
         }
 
-        await env.LINKS_KV.put('cached_aggregate', lines.join('\n'), { expirationTtl: 3600 });
+        const filteredLines = lines.filter(line => line !== null);
+        await env.LINKS_KV.put('cached_aggregate', filteredLines.join('\n'), { expirationTtl: 3600 });
         retryBatches++;
       }
 
-      console.log(`[Queue] Retry pass completed. Batches: ${retryBatches}, Processed: ${retryProcessed}, Failed: ${retryFailed}`);
+      console.log(`[Queue] Retry pass completed. Batches: ${retryBatches}, Processed: ${retryProcessed}, Failed: ${retryFailed}, Deleted: ${retryDeleted}`);
     }
 
-    console.log(`[Queue] All done. Total processed: ${processedCount + retryProcessed}, Total failed: ${retryFailed}, Skipped: ${skippedCount}`);
+    console.log(`[Queue] All done. Total processed: ${processedCount + retryProcessed}, Total failed: ${retryFailed}, Deleted: ${deletedCount + retryDeleted}, Skipped: ${skippedCount}`);
   } catch (e) {
     console.error('[Queue] Error in processIpQueue:', e.message);
   }
@@ -566,7 +581,8 @@ async function handleAdmin(env) {
   const cached = await env.LINKS_KV.get('cached_aggregate');
   let cacheInfo = '暂无缓存';
   if (cached) {
-    const totalLines = cached.split('\n').filter(l => l.trim() && !l.startsWith('#')).length;
+    const allLines = cached.split('\n');
+    const totalLines = allLines.filter(l => l.trim() && !l.startsWith('#')).length;
     const unprocessed = (cached.match(/#未处理/g) || []).length;
     const failed = (cached.match(/#分析失败/g) || []).length;
     const processed = totalLines - unprocessed - failed;
