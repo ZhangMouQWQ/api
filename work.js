@@ -11,7 +11,7 @@ export default {
     }
   },
 
-  // 整点半自动触发聚合（需在 wrangler.toml 配置 crons = ["*/30 * * * *"]）
+  // 整点半自动触发聚合（需在 wrangler.toml 配置 crons = ["0 * * * *"]）
   async scheduled(event, env, ctx) {
     try {
       console.log('[Scheduled] Aggregation started at', new Date().toISOString());
@@ -729,7 +729,7 @@ async function handleAdmin(env) {
     </div>
 
     <div class="cache-status">
-      <strong>缓存状态：</strong>${cacheInfo} &nbsp;|&nbsp; 每整半小时自动更新
+      <strong>缓存状态：</strong>${cacheInfo} &nbsp;|&nbsp; 每整点自动更新
     </div>
     
     <p>在下方输入框中填写链接，每行一个：</p>

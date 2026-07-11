@@ -3,7 +3,7 @@ main = "work.js"
 compatibility_date = "2024-01-01"
 
 [triggers]
-crons = ["*/30 * * * *"]
+crons = ["0 * * * *"]
 
 [[kv_namespaces]]
 binding = "LINKS_KV"
