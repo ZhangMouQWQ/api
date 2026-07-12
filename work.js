@@ -255,7 +255,7 @@ async function processIpQueue(env) {
             const cleanIp = getCleanIp(item.ip);
             ipCache.delete(cleanIp);
           }
-          location = await getIpLocation(item.ip);
+          location = await getIpLocation(item.ip, env);
         } catch (e) {
           console.error(`[Queue] Exception querying ${item.ip}:`, e.message);
           location = 'UN未知';
@@ -334,7 +334,7 @@ async function processIpQueue(env) {
 
           let location;
           try {
-            location = await getIpLocation(item.ip);
+            location = await getIpLocation(item.ip, env);
           } catch (e) {
             console.error(`[Queue Retry] Exception querying ${item.ip}:`, e.message);
             location = 'UN未知';
@@ -490,26 +490,62 @@ const countryCodeMap = {
 };
 
 // IP 查询成功率统计（按 API 维度）
-const apiStats = {
-  'uapis.cn': { success: 0, fail: 0 },
-  'ipapi.co': { success: 0, fail: 0 },
-  'ipinfo.io': { success: 0, fail: 0 },
-  'ip-api.com': { success: 0, fail: 0 }
-};
+// 使用 KV 持久化，避免 Worker 实例销毁后数据丢失
+const API_STATS_KEY = 'api_stats';
 
-function getApiStats() {
-  return Object.entries(apiStats).map(([name, s]) => {
+async function getApiStatsFromKV(env) {
+  try {
+    const stored = await env.LINKS_KV.get(API_STATS_KEY);
+    if (stored) {
+      return JSON.parse(stored);
+    }
+  } catch (e) {
+    console.error('Failed to read API stats from KV:', e.message);
+  }
+  return {
+    'uapis.cn': { success: 0, fail: 0 },
+    'ipapi.co': { success: 0, fail: 0 },
+    'ip-api.com': { success: 0, fail: 0 }
+  };
+}
+
+async function saveApiStatsToKV(env, stats) {
+  try {
+    await env.LINKS_KV.put(API_STATS_KEY, JSON.stringify(stats), { expirationTtl: 86400 * 30 });
+  } catch (e) {
+    console.error('Failed to save API stats to KV:', e.message);
+  }
+}
+
+async function incrementApiStat(env, apiName, isSuccess) {
+  const stats = await getApiStatsFromKV(env);
+  if (!stats[apiName]) {
+    stats[apiName] = { success: 0, fail: 0 };
+  }
+  if (isSuccess) {
+    stats[apiName].success++;
+  } else {
+    stats[apiName].fail++;
+  }
+  await saveApiStatsToKV(env, stats);
+}
+
+async function getApiStats(env) {
+  const stats = await getApiStatsFromKV(env);
+  return Object.entries(stats).map(([name, s]) => {
     const total = s.success + s.fail;
     const rate = total > 0 ? ((s.success / total) * 100).toFixed(1) : '0.0';
     return { name, success: s.success, fail: s.fail, total, rate };
   });
 }
 
-function resetApiStats() {
-  for (const key of Object.keys(apiStats)) {
-    apiStats[key].success = 0;
-    apiStats[key].fail = 0;
-  }
+async function resetApiStats(env) {
+  const defaultStats = {
+    'uapis.cn': { success: 0, fail: 0 },
+    'ipapi.co': { success: 0, fail: 0 },
+    'ip-api.com': { success: 0, fail: 0 }
+  };
+  await saveApiStatsToKV(env, defaultStats);
 }
 
 // 带超时的 fetch 包装器
@@ -527,7 +563,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 5000) {
 }
 
 // 查询 IP 地区信息（使用 uapis.cn 作为首选接口）
-async function getIpLocation(ip) {
+async function getIpLocation(ip, env) {
   // 清理 IP（去掉端口等）
   const cleanIp = getCleanIp(ip);
   
@@ -573,13 +609,13 @@ async function getIpLocation(ip) {
               else if (/^(中国|China|CN)/.test(region)) code = 'CN';
             }
             const countryName = countryCodeMap[code] || region.split(/\s+/)[0];
-            apiStats[apiName].success++;
+            if (env) await incrementApiStat(env, apiName, true);
             return `${code}${countryName}`;
           }
         }
         throw new Error('No region data');
       } catch (e) {
-        apiStats[apiName].fail++;
+        if (env) await incrementApiStat(env, apiName, false);
         throw e;
       }
     },
@@ -594,32 +630,12 @@ async function getIpLocation(ip) {
         const data = await response.json();
         if (data.country_code) {
           const code = data.country_code;
-          apiStats[apiName].success++;
+          if (env) await incrementApiStat(env, apiName, true);
           return `${code}${countryCodeMap[code] || data.country_name || '未知'}`;
         }
         throw new Error('No country data');
       } catch (e) {
-        apiStats[apiName].fail++;
-        throw e;
-      }
-    },
-    // ipinfo.io - 备选
-    async () => {
-      const apiName = 'ipinfo.io';
-      try {
-        const response = await fetchWithTimeout(`https://ipinfo.io/${cleanIp}/json`, {
-          cf: { cacheTtl: 86400 }
-        }, 3000);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = await response.json();
-        if (data.country) {
-          const code = data.country;
-          apiStats[apiName].success++;
-          return `${code}${countryCodeMap[code] || '未知'}`;
-        }
-        throw new Error('No country data');
-      } catch (e) {
-        apiStats[apiName].fail++;
+        if (env) await incrementApiStat(env, apiName, false);
         throw e;
       }
     },
@@ -634,12 +650,12 @@ async function getIpLocation(ip) {
         const data = await response.json();
         if (data.status === 'success' && data.countryCode) {
           const code = data.countryCode;
-          apiStats[apiName].success++;
+          if (env) await incrementApiStat(env, apiName, true);
           return `${code}${countryCodeMap[code] || data.country || '未知'}`;
         }
         throw new Error(data.message || 'API failed');
       } catch (e) {
-        apiStats[apiName].fail++;
+        if (env) await incrementApiStat(env, apiName, false);
         throw e;
       }
     }
@@ -751,7 +767,7 @@ async function handleAdmin(env) {
   }
   
   // 获取 API 成功率统计
-  const stats = getApiStats();
+  const stats = await getApiStats(env);
   const statsHtml = stats.map(s => {
     const barWidth = s.total > 0 ? s.rate : 0;
     const barColor = parseFloat(s.rate) >= 80 ? '#4caf50' : (parseFloat(s.rate) >= 50 ? '#ff9800' : '#f44336');
