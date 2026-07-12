@@ -219,9 +219,9 @@ async function processIpQueue(env) {
         let isUnknown = false;
 
         if (line.endsWith('#未处理')) {
-          contentWithoutMark = line.slice(0, -4);
+          contentWithoutMark = line.slice(0, -4); // 去掉 #未处理（4个字符）
         } else if (line.endsWith('#UN未知')) {
-          contentWithoutMark = line.slice(0, -5);
+          contentWithoutMark = line.slice(0, -5); // 去掉 #UN未知（5个字符）
           isUnknown = true;
         }
 
@@ -239,7 +239,7 @@ async function processIpQueue(env) {
 
       if (pendingItems.length === 0) {
         // 没有待处理项，检查是否有因 skipped 修改的行需要写回
-        if (skippedCount > 0 && batchCount === 0) {
+        if (skippedCount > 0) {
           const filteredLines = lines.filter(line => line !== null);
           await env.LINKS_KV.put('cached_aggregate', filteredLines.join('\n'), { expirationTtl: 3600 });
         }
@@ -252,7 +252,7 @@ async function processIpQueue(env) {
         try {
           // 清除缓存，强制重新查询（对旧版 #UN未知 尤其重要）
           if (item.isUnknown) {
-            const cleanIp = item.ip.split(':')[0].trim();
+            const cleanIp = getCleanIp(item.ip);
             ipCache.delete(cleanIp);
           }
           location = await getIpLocation(item.ip);
@@ -261,7 +261,7 @@ async function processIpQueue(env) {
           location = 'UN未知';
         }
 
-        if (location === 'UN未知' || location === '分析失败') {
+        if (location === 'UN未知') {
           // 首次失败，标记为 #分析失败-待重试，等待 1 分钟后重试
           lines[item.index] = `${item.line}#分析失败-待重试`;
           retryLaterCount++;
@@ -288,14 +288,14 @@ async function processIpQueue(env) {
     console.log(`[Queue] First pass completed. Batches: ${batchCount}, Processed: ${processedCount}, Failed: ${retryLaterCount}, Deleted: ${deletedCount}, Skipped: ${skippedCount}`);
 
     // 第二轮：重试 #分析失败-待重试 的项（等待 1 分钟后）
+    let retryProcessed = 0;
+    let retryFailed = 0;
+    let retryDeleted = 0;
+    let retryBatches = 0;
+    
     if (retryLaterCount > 0) {
       console.log('[Queue] Waiting 1 minute before retrying failed items...');
       await sleep(60000);
-      
-      let retryProcessed = 0;
-      let retryFailed = 0;
-      let retryDeleted = 0;
-      let retryBatches = 0;
 
       while (true) {
         const current = await env.LINKS_KV.get('cached_aggregate');
@@ -303,6 +303,7 @@ async function processIpQueue(env) {
 
         const lines = current.split('\n');
         const retryItems = [];
+        let retrySkipped = 0;
 
         for (let i = 0; i < lines.length && retryItems.length < MAX_BATCH; i++) {
           const line = lines[i];
@@ -313,15 +314,22 @@ async function processIpQueue(env) {
               retryItems.push({ index: i, line: contentWithoutMark, ip });
             } else {
               lines[i] = contentWithoutMark;
+              retrySkipped++;
             }
           }
         }
 
-        if (retryItems.length === 0) break;
+        if (retryItems.length === 0) {
+          if (retrySkipped > 0) {
+            const filteredLines = lines.filter(line => line !== null);
+            await env.LINKS_KV.put('cached_aggregate', filteredLines.join('\n'), { expirationTtl: 3600 });
+          }
+          break;
+        }
 
         for (const item of retryItems) {
           // 重试时清除缓存，强制重新查询
-          const cleanIp = item.ip.split(':')[0].trim();
+          const cleanIp = getCleanIp(item.ip);
           ipCache.delete(cleanIp);
 
           let location;
@@ -332,7 +340,7 @@ async function processIpQueue(env) {
             location = 'UN未知';
           }
 
-          if (location === 'UN未知' || location === '分析失败') {
+          if (location === 'UN未知') {
             // 重试仍然失败，标记为最终 #分析失败
             lines[item.index] = `${item.line}#分析失败`;
             retryFailed++;
@@ -384,7 +392,7 @@ async function handleRetryFailed(env, ctx, corsHeaders) {
     const updatedLines = lines.map(line => {
       if (line.endsWith('#分析失败')) {
         retryCount++;
-        return line.slice(0, -5) + '#未处理';
+        return line.slice(0, -5) + '#未处理'; // 去掉 #分析失败（5个字符），加上 #未处理
       }
       return line;
     });
@@ -521,7 +529,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 5000) {
 // 查询 IP 地区信息（使用 uapis.cn 作为首选接口）
 async function getIpLocation(ip) {
   // 清理 IP（去掉端口等）
-  const cleanIp = ip.split(':')[0].trim();
+  const cleanIp = getCleanIp(ip);
   
   // 检查缓存
   if (ipCache.has(cleanIp)) {
@@ -655,24 +663,65 @@ async function getIpLocation(ip) {
   return result;
 }
 
+// 清理 IP（去掉端口等），兼容 IPv4 和 IPv6
+function getCleanIp(ip) {
+  // IPv6 方括号格式: [2001:db8::1]:8080
+  const ipv6BracketMatch = ip.match(/^\[([0-9a-fA-F:]+)\](?::\d+)?$/);
+  if (ipv6BracketMatch) {
+    return ipv6BracketMatch[1];
+  }
+  // IPv6 裸格式（理论上不应有端口，但做兼容）
+  if (ip.includes(':') && !ip.includes('.')) {
+    // 可能是 IPv6，直接返回（IPv6 本身含冒号，不应有端口后缀）
+    return ip.split('%')[0].trim(); // 去掉 zone index
+  }
+  // IPv4 格式: 1.2.3.4:8080
+  return ip.split(':')[0].trim();
+}
+
 // 从行中提取 IP 地址
 function extractIp(line) {
   const ipv4Match = line.match(/\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(:\d+)?\b/);
-  if (ipv4Match) {
+  if (ipv4Match && isValidIPv4(ipv4Match[1])) {
     return ipv4Match[1] + (ipv4Match[2] || '');
   }
   
-  const ipv6Match = line.match(/\[([0-9a-fA-F:]+)\]/);
-  if (ipv6Match) {
-    return ipv6Match[1];
+  const ipv6BracketMatch = line.match(/\[([0-9a-fA-F:]+)\](?::\d+)?/);
+  if (ipv6BracketMatch && isValidIPv6(ipv6BracketMatch[1])) {
+    return ipv6BracketMatch[1];
   }
   
-  const ipv6BareMatch = line.match(/\b([0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){2,})\b/);
-  if (ipv6BareMatch) {
+  const ipv6BareMatch = line.match(/\b([0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){2,7})\b/);
+  if (ipv6BareMatch && isValidIPv6(ipv6BareMatch[1])) {
     return ipv6BareMatch[1];
   }
   
   return null;
+}
+
+// 验证 IPv4 地址是否合法
+function isValidIPv4(ip) {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return false;
+  return parts.every(p => {
+    const num = parseInt(p, 10);
+    return p === String(num) && num >= 0 && num <= 255;
+  });
+}
+
+// 验证 IPv6 地址是否合法（基本格式检查）
+function isValidIPv6(ip) {
+  if (!ip || ip.length < 2) return false;
+  // 不能有两个以上的 ::
+  const doubleColonCount = (ip.match(/::/g) || []).length;
+  if (doubleColonCount > 1) return false;
+  // 拆分各组
+  const groups = ip.split(':');
+  // 处理 :: 压缩的情况
+  const validGroups = groups.filter(g => g !== '');
+  if (doubleColonCount === 0 && validGroups.length !== 8) return false;
+  if (doubleColonCount === 1 && validGroups.length >= 8) return false;
+  return validGroups.every(g => /^[0-9a-fA-F]{1,4}$/.test(g));
 }
 
 // ==================== 管理后台 HTML ====================
@@ -683,11 +732,22 @@ async function handleAdmin(env) {
   let cacheInfo = '暂无缓存';
   if (cached) {
     const allLines = cached.split('\n');
-    const totalLines = allLines.filter(l => l.trim() && !l.startsWith('#')).length;
-    const unprocessed = (cached.match(/#未处理/g) || []).length;
-    const failed = (cached.match(/#分析失败/g) || []).length;
-    const processed = totalLines - unprocessed - failed;
-    cacheInfo = `已缓存（约 ${totalLines} 条记录，已处理 ${processed}，未处理 ${unprocessed}，失败 ${failed}）`;
+    let totalLines = 0;
+    let unprocessed = 0;
+    let failed = 0;
+    let failedRetry = 0;
+    
+    for (const line of allLines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      totalLines++;
+      if (trimmed.endsWith('#未处理')) unprocessed++;
+      else if (trimmed.endsWith('#分析失败')) failed++;
+      else if (trimmed.endsWith('#分析失败-待重试')) failedRetry++;
+    }
+    
+    const processed = totalLines - unprocessed - failed - failedRetry;
+    cacheInfo = `已缓存（约 ${totalLines} 条记录，已处理 ${processed}，未处理 ${unprocessed}，待重试 ${failedRetry}，失败 ${failed}）`;
   }
   
   // 获取 API 成功率统计
