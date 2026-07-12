@@ -52,6 +52,10 @@ async function handleRequest(request, env, ctx) {
     return handleFetch(env, corsHeaders);
   }
 
+  if (url.pathname === '/retry-failed' && request.method === 'POST') {
+    return handleRetryFailed(env, ctx, corsHeaders);
+  }
+
   if (url.pathname === '/' || url.pathname === '') {
     const accept = request.headers.get('Accept') || '';
     const userAgent = request.headers.get('User-Agent') || '';
@@ -364,6 +368,52 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+async function handleRetryFailed(env, ctx, corsHeaders) {
+  try {
+    const cached = await env.LINKS_KV.get('cached_aggregate');
+    if (!cached) {
+      return new Response('No cache found', { 
+        status: 404,
+        headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+      });
+    }
+
+    const lines = cached.split('\n');
+    let retryCount = 0;
+
+    const updatedLines = lines.map(line => {
+      if (line.endsWith('#分析失败')) {
+        retryCount++;
+        return line.slice(0, -5) + '#未处理';
+      }
+      return line;
+    });
+
+    if (retryCount === 0) {
+      return new Response('没有分析失败的 IP 需要重试', {
+        headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+      });
+    }
+
+    const updated = updatedLines.join('\n');
+    await env.LINKS_KV.put('cached_aggregate', updated, { expirationTtl: 3600 });
+
+    // 启动后台重新处理
+    if (ctx) {
+      ctx.waitUntil(processIpQueue(env));
+    }
+
+    return new Response(`已将 ${retryCount} 个分析失败的 IP 重新加入队列，后台开始处理`, {
+      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+    });
+  } catch (e) {
+    return new Response('Retry Error: ' + e.message, { 
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+    });
+  }
+}
+
 // ==================== /fetch 端点（直接返回当前缓存） ====================
 
 async function handleFetch(env, corsHeaders) {
@@ -431,6 +481,29 @@ const countryCodeMap = {
   'YE': '也门', 'MO': '澳门'
 };
 
+// IP 查询成功率统计（按 API 维度）
+const apiStats = {
+  'uapis.cn': { success: 0, fail: 0 },
+  'ipapi.co': { success: 0, fail: 0 },
+  'ipinfo.io': { success: 0, fail: 0 },
+  'ip-api.com': { success: 0, fail: 0 }
+};
+
+function getApiStats() {
+  return Object.entries(apiStats).map(([name, s]) => {
+    const total = s.success + s.fail;
+    const rate = total > 0 ? ((s.success / total) * 100).toFixed(1) : '0.0';
+    return { name, success: s.success, fail: s.fail, total, rate };
+  });
+}
+
+function resetApiStats() {
+  for (const key of Object.keys(apiStats)) {
+    apiStats[key].success = 0;
+    apiStats[key].fail = 0;
+  }
+}
+
 // 带超时的 fetch 包装器
 async function fetchWithTimeout(url, options = {}, timeoutMs = 5000) {
   const controller = new AbortController();
@@ -459,80 +532,108 @@ async function getIpLocation(ip) {
   const apis = [
     // uapis.cn - 首选，返回中文地区信息更完整
     async () => {
-      const response = await fetchWithTimeout(`https://uapis.cn/api/v1/network/ipinfo?ip=${cleanIp}`, {
-        cf: { cacheTtl: 86400 }
-      }, 3000);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = await response.json();
-      if (data.region) {
-        const region = data.region.trim();
-        if (region) {
-          let code = 'UN';
-          for (const [k, v] of Object.entries(countryCodeMap)) {
-            if (region.includes(v)) {
-              code = k;
-              break;
+      const apiName = 'uapis.cn';
+      try {
+        const response = await fetchWithTimeout(`https://uapis.cn/api/v1/network/ipinfo?ip=${cleanIp}`, {
+          cf: { cacheTtl: 86400 }
+        }, 3000);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (data.region) {
+          const region = data.region.trim();
+          if (region) {
+            let code = 'UN';
+            for (const [k, v] of Object.entries(countryCodeMap)) {
+              if (region.includes(v)) {
+                code = k;
+                break;
+              }
             }
+            if (code === 'UN') {
+              if (/^(美国|USA?|United States)/.test(region)) code = 'US';
+              else if (/^(日本|Japan|JP)/.test(region)) code = 'JP';
+              else if (/^(韩国|Korea|KR)/.test(region)) code = 'KR';
+              else if (/^(新加坡|Singapore|SG)/.test(region)) code = 'SG';
+              else if (/^(香港|Hong Kong|HK)/.test(region)) code = 'HK';
+              else if (/^(台湾|Taiwan|TW)/.test(region)) code = 'TW';
+              else if (/^(英国|United Kingdom|GB|UK)/.test(region)) code = 'GB';
+              else if (/^(德国|Germany|DE)/.test(region)) code = 'DE';
+              else if (/^(法国|France|FR)/.test(region)) code = 'FR';
+              else if (/^(俄罗斯|Russia|RU)/.test(region)) code = 'RU';
+              else if (/^(加拿大|Canada|CA)/.test(region)) code = 'CA';
+              else if (/^(澳大利亚|Australia|AU)/.test(region)) code = 'AU';
+              else if (/^(中国|China|CN)/.test(region)) code = 'CN';
+            }
+            const countryName = countryCodeMap[code] || region.split(/\s+/)[0];
+            apiStats[apiName].success++;
+            return `${code}${countryName}`;
           }
-          if (code === 'UN') {
-            if (/^(美国|USA?|United States)/.test(region)) code = 'US';
-            else if (/^(日本|Japan|JP)/.test(region)) code = 'JP';
-            else if (/^(韩国|Korea|KR)/.test(region)) code = 'KR';
-            else if (/^(新加坡|Singapore|SG)/.test(region)) code = 'SG';
-            else if (/^(香港|Hong Kong|HK)/.test(region)) code = 'HK';
-            else if (/^(台湾|Taiwan|TW)/.test(region)) code = 'TW';
-            else if (/^(英国|United Kingdom|GB|UK)/.test(region)) code = 'GB';
-            else if (/^(德国|Germany|DE)/.test(region)) code = 'DE';
-            else if (/^(法国|France|FR)/.test(region)) code = 'FR';
-            else if (/^(俄罗斯|Russia|RU)/.test(region)) code = 'RU';
-            else if (/^(加拿大|Canada|CA)/.test(region)) code = 'CA';
-            else if (/^(澳大利亚|Australia|AU)/.test(region)) code = 'AU';
-            else if (/^(中国|China|CN)/.test(region)) code = 'CN';
-          }
-          const countryName = countryCodeMap[code] || region.split(/\s+/)[0];
-          return `${code}${countryName}`;
         }
+        throw new Error('No region data');
+      } catch (e) {
+        apiStats[apiName].fail++;
+        throw e;
       }
-      throw new Error('No region data');
     },
     // ipapi.co - 备选
     async () => {
-      const response = await fetchWithTimeout(`https://ipapi.co/${cleanIp}/json/`, {
-        cf: { cacheTtl: 86400 }
-      }, 3000);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = await response.json();
-      if (data.country_code) {
-        const code = data.country_code;
-        return `${code}${countryCodeMap[code] || data.country_name || '未知'}`;
+      const apiName = 'ipapi.co';
+      try {
+        const response = await fetchWithTimeout(`https://ipapi.co/${cleanIp}/json/`, {
+          cf: { cacheTtl: 86400 }
+        }, 3000);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (data.country_code) {
+          const code = data.country_code;
+          apiStats[apiName].success++;
+          return `${code}${countryCodeMap[code] || data.country_name || '未知'}`;
+        }
+        throw new Error('No country data');
+      } catch (e) {
+        apiStats[apiName].fail++;
+        throw e;
       }
-      throw new Error('No country data');
     },
     // ipinfo.io - 备选
     async () => {
-      const response = await fetchWithTimeout(`https://ipinfo.io/${cleanIp}/json`, {
-        cf: { cacheTtl: 86400 }
-      }, 3000);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = await response.json();
-      if (data.country) {
-        const code = data.country;
-        return `${code}${countryCodeMap[code] || '未知'}`;
+      const apiName = 'ipinfo.io';
+      try {
+        const response = await fetchWithTimeout(`https://ipinfo.io/${cleanIp}/json`, {
+          cf: { cacheTtl: 86400 }
+        }, 3000);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (data.country) {
+          const code = data.country;
+          apiStats[apiName].success++;
+          return `${code}${countryCodeMap[code] || '未知'}`;
+        }
+        throw new Error('No country data');
+      } catch (e) {
+        apiStats[apiName].fail++;
+        throw e;
       }
-      throw new Error('No country data');
     },
     // ip-api.com - 最后备选
     async () => {
-      const response = await fetchWithTimeout(`http://ip-api.com/json/${cleanIp}?fields=status,country,countryCode,message&lang=zh-CN`, {
-        cf: { cacheTtl: 86400 }
-      }, 3000);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = await response.json();
-      if (data.status === 'success' && data.countryCode) {
-        const code = data.countryCode;
-        return `${code}${countryCodeMap[code] || data.country || '未知'}`;
+      const apiName = 'ip-api.com';
+      try {
+        const response = await fetchWithTimeout(`http://ip-api.com/json/${cleanIp}?fields=status,country,countryCode,message&lang=zh-CN`, {
+          cf: { cacheTtl: 86400 }
+        }, 3000);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (data.status === 'success' && data.countryCode) {
+          const code = data.countryCode;
+          apiStats[apiName].success++;
+          return `${code}${countryCodeMap[code] || data.country || '未知'}`;
+        }
+        throw new Error(data.message || 'API failed');
+      } catch (e) {
+        apiStats[apiName].fail++;
+        throw e;
       }
-      throw new Error(data.message || 'API failed');
     }
   ];
   
@@ -589,6 +690,24 @@ async function handleAdmin(env) {
     cacheInfo = `已缓存（约 ${totalLines} 条记录，已处理 ${processed}，未处理 ${unprocessed}，失败 ${failed}）`;
   }
   
+  // 获取 API 成功率统计
+  const stats = getApiStats();
+  const statsHtml = stats.map(s => {
+    const barWidth = s.total > 0 ? s.rate : 0;
+    const barColor = parseFloat(s.rate) >= 80 ? '#4caf50' : (parseFloat(s.rate) >= 50 ? '#ff9800' : '#f44336');
+    return `
+      <div class="api-stat-item">
+        <div class="api-stat-header">
+          <span class="api-name">${s.name}</span>
+          <span class="api-rate">${s.rate}%</span>
+        </div>
+        <div class="api-bar-bg">
+          <div class="api-bar-fill" style="width: ${barWidth}%; background: ${barColor};"></div>
+        </div>
+        <div class="api-stat-detail">成功 ${s.success} / 失败 ${s.fail} / 总计 ${s.total}</div>
+      </div>`;
+  }).join('');
+  
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -626,6 +745,60 @@ async function handleAdmin(env) {
       border-radius: 4px;
       font-family: monospace;
       border: 1px solid #bbdefb;
+    }
+    .api-stats {
+      background: #e8f5e9;
+      padding: 15px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      font-size: 14px;
+      color: #2e7d32;
+    }
+    .api-stats h3 {
+      margin: 0 0 12px 0;
+      font-size: 15px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .api-stats h3::before {
+      content: "📊";
+    }
+    .api-stat-item {
+      margin-bottom: 10px;
+    }
+    .api-stat-item:last-child {
+      margin-bottom: 0;
+    }
+    .api-stat-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 4px;
+    }
+    .api-name {
+      font-weight: 600;
+      color: #1b5e20;
+    }
+    .api-rate {
+      font-weight: 700;
+      font-size: 15px;
+    }
+    .api-bar-bg {
+      height: 8px;
+      background: #c8e6c9;
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .api-bar-fill {
+      height: 100%;
+      border-radius: 4px;
+      transition: width 0.3s ease;
+    }
+    .api-stat-detail {
+      font-size: 12px;
+      color: #558b2f;
+      margin-top: 3px;
     }
     .cache-status {
       background: #f3e5f5;
@@ -678,6 +851,12 @@ async function handleAdmin(env) {
     }
     button:hover { background: #1976d2; }
     button:disabled { background: #ccc; cursor: not-allowed; }
+    .retry-btn {
+      background: #ff9800;
+    }
+    .retry-btn:hover {
+      background: #f57c00;
+    }
     .refresh-btn {
       background: #4caf50;
     }
@@ -728,6 +907,11 @@ async function handleAdmin(env) {
       <strong>IP 地区分析：</strong>自动识别每行中的 IP 地址并标注所属国家（如 <code>#CN中国</code>）
     </div>
 
+    <div class="api-stats">
+      <h3>API 查询成功率</h3>
+      ${statsHtml}
+    </div>
+
     <div class="cache-status">
       <strong>缓存状态：</strong>${cacheInfo} &nbsp;|&nbsp; 每整点自动更新
     </div>
@@ -738,6 +922,7 @@ async function handleAdmin(env) {
     <div class="button-row">
       <button onclick="save()" id="saveBtn">保存链接</button>
       <button onclick="refreshCache()" id="refreshBtn" class="refresh-btn">立即刷新缓存</button>
+      <button onclick="retryFailed()" id="retryBtn" class="retry-btn">重试分析失败</button>
       <div id="status" class="status"></div>
     </div>
     
@@ -752,6 +937,7 @@ async function handleAdmin(env) {
         <li><strong>新增：</strong>自动识别每行中的 IP 地址，并在末尾追加 <code>#国家简拼国家名</code> 的地区信息</li>
         <li><span class="badge badge-new">NEW</span> <strong>后台异步处理：</strong>时间触发器触发后，先快速返回带 <code>#未处理</code> 标记的结果，之后在后台逐个分析 IP 归属地，成功替换为实际地区，失败标记 <code>#分析失败</code></li>
         <li><span class="badge badge-new">NEW</span> <strong>实时进度：</strong>后台处理期间，外部请求直接返回当前处理进度（已处理 / 未处理 / 分析失败）</li>
+        <li><span class=\"badge badge-new\">NEW</span> <strong>重试失败：</strong>如果某些 IP 分析失败，可点击「重试分析失败」按钮，将这些 IP 重新标记为 <code>#未处理</code> 并再次进入分析流程</li>
         <li>示例输出：<code>192.168.1.1:8080#CN中国</code>、<code>1.2.3.4:443#未处理</code>、<code>5.6.7.8:80#分析失败</code></li>
       </ul>
     </div>
@@ -809,6 +995,33 @@ async function handleAdmin(env) {
           const text = await res.text();
           status.className = 'status error';
           status.textContent = '✗ 刷新失败: ' + text;
+        }
+      } catch (e) {
+        status.className = 'status error';
+        status.textContent = '✗ 错误: ' + e.message;
+      }
+      
+      btn.disabled = false;
+    }
+    async function retryFailed() {
+      const btn = document.getElementById('retryBtn');
+      const status = document.getElementById('status');
+      
+      btn.disabled = true;
+      status.style.display = 'none';
+      status.textContent = '重试中...';
+      status.className = 'status';
+      status.style.display = 'block';
+      
+      try {
+        const res = await fetch('/retry-failed', { method: 'POST' });
+        const text = await res.text();
+        if (res.ok) {
+          status.className = 'status success';
+          status.textContent = '✓ ' + text;
+        } else {
+          status.className = 'status error';
+          status.textContent = '✗ 重试失败: ' + text;
         }
       } catch (e) {
         status.className = 'status error';
