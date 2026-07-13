@@ -7,4 +7,4 @@ crons = ["0 * * * *"]
 
 [[kv_namespaces]]
 binding = "LINKS_KV"
-id = "43913a1556a94d0e82496c7faa9431a6"
+id = "28d6badfd4b94b09b5c3584ccdbc5065"
