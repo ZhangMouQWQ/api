@@ -202,7 +202,7 @@ async function processIpQueue(env) {
     let retryLaterCount = 0;
     let deletedCount = 0;
     let batchCount = 0;
-    const MAX_BATCH = 10; // 每批处理 10 个 IP 再写回 KV，减少 KV 操作次数
+    const MAX_BATCH = 100; // 每批处理 100 个 IP 再写回 KV，大幅减少 KV 操作次数
 
     while (true) {
       // 读取当前缓存
@@ -489,52 +489,29 @@ const countryCodeMap = {
   'YE': '也门', 'MO': '澳门'
 };
 
-// IP 查询成功率统计（按 API 维度）
-// 使用 KV 持久化，避免 Worker 实例销毁后数据丢失
-const API_STATS_KEY = 'api_stats';
-
-async function getApiStatsFromKV(env) {
-  try {
-    const stored = await env.LINKS_KV.get(API_STATS_KEY);
-    if (stored) {
-      return JSON.parse(stored);
-    }
-  } catch (e) {
-    console.error('Failed to read API stats from KV:', e.message);
-  }
-  return {
-    'uapis.cn': { success: 0, fail: 0 },
-    'ipwho.is': { success: 0, fail: 0 },
-    'ipinfo.io': { success: 0, fail: 0 },
-    'ifconfig.co': { success: 0, fail: 0 },
-    'api.ip.sb': { success: 0, fail: 0 }
-  };
-}
-
-async function saveApiStatsToKV(env, stats) {
-  try {
-    await env.LINKS_KV.put(API_STATS_KEY, JSON.stringify(stats), { expirationTtl: 86400 * 30 });
-  } catch (e) {
-    console.error('Failed to save API stats to KV:', e.message);
-  }
-}
+// IP 查询成功率统计（内存统计，避免频繁 KV 写入导致超限）
+const apiStatsMemory = {
+  'uapis.cn': { success: 0, fail: 0 },
+  'ipwho.is': { success: 0, fail: 0 },
+  'ipinfo.io': { success: 0, fail: 0 },
+  'ifconfig.co': { success: 0, fail: 0 },
+  'api.ip.sb': { success: 0, fail: 0 }
+};
 
 async function incrementApiStat(env, apiName, isSuccess) {
-  const stats = await getApiStatsFromKV(env);
-  if (!stats[apiName]) {
-    stats[apiName] = { success: 0, fail: 0 };
+  if (!apiStatsMemory[apiName]) {
+    apiStatsMemory[apiName] = { success: 0, fail: 0 };
   }
   if (isSuccess) {
-    stats[apiName].success++;
+    apiStatsMemory[apiName].success++;
   } else {
-    stats[apiName].fail++;
+    apiStatsMemory[apiName].fail++;
   }
-  await saveApiStatsToKV(env, stats);
+  // 不再写入 KV，完全避免 KV put 消耗
 }
 
 async function getApiStats(env) {
-  const stats = await getApiStatsFromKV(env);
-  return Object.entries(stats).map(([name, s]) => {
+  return Object.entries(apiStatsMemory).map(([name, s]) => {
     const total = s.success + s.fail;
     const rate = total > 0 ? ((s.success / total) * 100).toFixed(1) : '0.0';
     return { name, success: s.success, fail: s.fail, total, rate };
@@ -542,14 +519,9 @@ async function getApiStats(env) {
 }
 
 async function resetApiStats(env) {
-  const defaultStats = {
-    'uapis.cn': { success: 0, fail: 0 },
-    'ipwho.is': { success: 0, fail: 0 },
-    'ipinfo.io': { success: 0, fail: 0 },
-    'ifconfig.co': { success: 0, fail: 0 },
-    'api.ip.sb': { success: 0, fail: 0 }
-  };
-  await saveApiStatsToKV(env, defaultStats);
+  for (const key of Object.keys(apiStatsMemory)) {
+    apiStatsMemory[key] = { success: 0, fail: 0 };
+  }
 }
 
 // 带超时的 fetch 包装器
