@@ -504,8 +504,10 @@ async function getApiStatsFromKV(env) {
   }
   return {
     'uapis.cn': { success: 0, fail: 0 },
-    'ipapi.co': { success: 0, fail: 0 },
-    'ip-api.com': { success: 0, fail: 0 }
+    'ipwho.is': { success: 0, fail: 0 },
+    'ipinfo.io': { success: 0, fail: 0 },
+    'ifconfig.co': { success: 0, fail: 0 },
+    'api.ip.sb': { success: 0, fail: 0 }
   };
 }
 
@@ -542,8 +544,10 @@ async function getApiStats(env) {
 async function resetApiStats(env) {
   const defaultStats = {
     'uapis.cn': { success: 0, fail: 0 },
-    'ipapi.co': { success: 0, fail: 0 },
-    'ip-api.com': { success: 0, fail: 0 }
+    'ipwho.is': { success: 0, fail: 0 },
+    'ipinfo.io': { success: 0, fail: 0 },
+    'ifconfig.co': { success: 0, fail: 0 },
+    'api.ip.sb': { success: 0, fail: 0 }
   };
   await saveApiStatsToKV(env, defaultStats);
 }
@@ -572,7 +576,7 @@ async function getIpLocation(ip, env) {
     return ipCache.get(cleanIp);
   }
   
-  // 依次尝试多个 API
+  // 依次尝试多个 API；优先使用可用性更稳定的公开接口
   const apis = [
     // uapis.cn - 首选，返回中文地区信息更完整
     async () => {
@@ -619,19 +623,20 @@ async function getIpLocation(ip, env) {
         throw e;
       }
     },
-    // ipapi.co - 备选
+    // ipwho.is - 备选，返回稳定的 country_code
     async () => {
-      const apiName = 'ipapi.co';
+      const apiName = 'ipwho.is';
       try {
-        const response = await fetchWithTimeout(`https://ipapi.co/${cleanIp}/json/`, {
+        const response = await fetchWithTimeout(`https://ipwho.is/${cleanIp}?output=json`, {
           cf: { cacheTtl: 86400 }
         }, 3000);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
-        if (data.country_code) {
-          const code = data.country_code;
+        if (data.country_code || data.country || data.country_code2) {
+          const code = data.country_code || data.country_code2 || '';
+          const countryName = countryCodeMap[code] || data.country || data.country_name || '未知';
           if (env) await incrementApiStat(env, apiName, true);
-          return `${code}${countryCodeMap[code] || data.country_name || '未知'}`;
+          return `${code}${countryName}`;
         }
         throw new Error('No country data');
       } catch (e) {
@@ -639,21 +644,63 @@ async function getIpLocation(ip, env) {
         throw e;
       }
     },
-    // ip-api.com - 最后备选
+    // ipinfo.io - 备选
     async () => {
-      const apiName = 'ip-api.com';
+      const apiName = 'ipinfo.io';
       try {
-        const response = await fetchWithTimeout(`http://ip-api.com/json/${cleanIp}?fields=status,country,countryCode,message&lang=zh-CN`, {
+        const response = await fetchWithTimeout(`https://ipinfo.io/${cleanIp}/json`, {
           cf: { cacheTtl: 86400 }
         }, 3000);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
-        if (data.status === 'success' && data.countryCode) {
-          const code = data.countryCode;
+        if (data.country) {
+          const code = data.country;
           if (env) await incrementApiStat(env, apiName, true);
-          return `${code}${countryCodeMap[code] || data.country || '未知'}`;
+          return `${code}${countryCodeMap[code] || '未知'}`;
         }
-        throw new Error(data.message || 'API failed');
+        throw new Error('No country data');
+      } catch (e) {
+        if (env) await incrementApiStat(env, apiName, false);
+        throw e;
+      }
+    },
+    // ifconfig.co - 备选
+    async () => {
+      const apiName = 'ifconfig.co';
+      try {
+        const response = await fetchWithTimeout(`https://ifconfig.co/json?ip=${cleanIp}`, {
+          cf: { cacheTtl: 86400 }
+        }, 3000);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (data.country_iso || data.country) {
+          const code = data.country_iso || data.country || '';
+          const countryName = countryCodeMap[code] || data.country || '未知';
+          if (env) await incrementApiStat(env, apiName, true);
+          return `${code}${countryName}`;
+        }
+        throw new Error('No country data');
+      } catch (e) {
+        if (env) await incrementApiStat(env, apiName, false);
+        throw e;
+      }
+    },
+    // api.ip.sb - 最后备选
+    async () => {
+      const apiName = 'api.ip.sb';
+      try {
+        const response = await fetchWithTimeout(`https://api.ip.sb/geoip/${cleanIp}`, {
+          cf: { cacheTtl: 86400 }
+        }, 3000);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (data.country_code || data.country) {
+          const code = data.country_code || data.country || '';
+          const countryName = countryCodeMap[code] || data.country || '未知';
+          if (env) await incrementApiStat(env, apiName, true);
+          return `${code}${countryName}`;
+        }
+        throw new Error('No country data');
       } catch (e) {
         if (env) await incrementApiStat(env, apiName, false);
         throw e;
